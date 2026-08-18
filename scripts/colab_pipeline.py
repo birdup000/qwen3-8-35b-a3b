@@ -415,6 +415,34 @@ def run_full_pipeline(
     return {"student": student_dir, "logits": logits_dir, "lora": adapter_dir, "hf": hf_dir}
 
 
+def export_unsloth_xl_gguf(
+    *,
+    work_dir: Path,
+    lora_dir: Path | None = None,
+    hf_dir: Path | None = None,
+    out_dir: Path | None = None,
+    quants: list[str] | tuple[str, ...] = ("Q4_K_XL",),
+    base_id: str = DEFAULT_STUDENT,
+    free_teacher: bool = True,
+    imatrix: bool = True,
+    keep_bf16: bool = False,
+) -> dict[str, Path]:
+    """After distill: merge LoRA and write Unsloth-style UD-Q4_K_XL / UD-Q3_K_XL GGUFs."""
+    from scripts.export_gguf import export_gguf
+
+    return export_gguf(
+        work_dir=work_dir,
+        quants=quants,
+        lora_dir=lora_dir,
+        hf_dir=hf_dir,
+        base_id=base_id,
+        out_dir=out_dir,
+        imatrix=imatrix,
+        keep_bf16=keep_bf16,
+        free_teacher=free_teacher,
+    )
+
+
 def export_hf_snapshot(src: Path, out: Path, yarn: bool = False) -> Path:
     cmd = [sys.executable, str(REPO_ROOT / "scripts" / "export_hf.py"), "--src", str(src), "--out", str(out)]
     if yarn:

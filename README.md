@@ -45,9 +45,23 @@ python scripts/distill_from_qwen38.py \
 python scripts/export_hf.py \
   --src checkpoints/Qwen3.8-35B-A3B-distilled \
   --out checkpoints/Qwen3.8-35B-A3B-hf
+
+python scripts/export_gguf.py \
+  --lora checkpoints/Qwen3.8-35B-A3B-lora \
+  --work-dir /tmp/qwen38_gguf \
+  --out-dir checkpoints \
+  --quant Q4_K_XL \
+  --quant Q3_K_XL
 ```
 
-Serve the export like Qwen3.6-35B-A3B:
+That writes Unsloth-style XL GGUFs:
+
+* `Qwen3.8-35B-A3B-UD-Q4_K_XL.gguf` (~20GB, default)
+* `Qwen3.8-35B-A3B-UD-Q3_K_XL.gguf` (~16GB)
+
+The recipe is Q3_K_M / Q4_K_M plus Q8_0 embeddings and output, Q8_0 Gated DeltaNet `ssm_out`, and a higher-bit `ffn_down` / attention bump — the public Unsloth/Bartowski XL pattern, not bit-identical to Unsloth Dynamic 2.0 Hub uploads. Needs a recent [llama.cpp](https://github.com/ggml-org/llama.cpp) with `qwen3_5_moe` / `switch_mlp` conversion. Peak disk is large: merged BF16 ~70GB + BF16 GGUF ~67GB before the XL file is written.
+
+Serve the HF export like Qwen3.6-35B-A3B:
 
 ```bash
 vllm serve checkpoints/Qwen3.8-35B-A3B-hf
@@ -102,7 +116,7 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 [Open in Colab](https://colab.research.google.com/github/birdup000/qwen3-8-35b-a3b/blob/main/notebooks/Qwen3.8-35B-A3B_Colab.ipynb)
 
-Runtime → **A100 40GB+**. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
+Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16. After distill, section 8 merges the LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
 
 ## License
 
