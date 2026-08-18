@@ -36,6 +36,14 @@ SAMPLE_TEXTS = [
     "Given a git rebase conflict in main, write the exact commands to abort and then rebase onto origin/main.",
     "Translate this into a SQL query: customers who spent more than $500 in March 2026.",
     "What is the difference between temperature, top_p, and reasoning_effort when sampling a thinking model?",
+    "Write a FastAPI endpoint that streams tokens from an OpenAI-compatible client.",
+    "Explain YaRN rope scaling and when not to apply it to short prompts.",
+    "Given a flaky pytest that only fails under xdist, list a systematic debug order.",
+    "Convert this into a typed TypeScript function: function add(a, b) { return a + b }",
+    "Plan a 4-step agent that edits a repo, runs tests, and opens a pull request.",
+    "Why does GQA with 16 query heads and 2 KV heads shrink the KV cache?",
+    "Write a bash one-liner that finds the largest directories under /content.",
+    "Critique this SQL: SELECT * FROM users WHERE created_at = '2026-08-17'.",
 ]
 
 
@@ -72,9 +80,16 @@ def ensure_repo(repo_root: str | Path | None = None) -> Path:
     return root
 
 
-def write_sample_data(path: Path, extra: list[str] | None = None) -> Path:
+def write_sample_data(path: Path, extra: list[str] | None = None, min_rows: int = 64) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = SAMPLE_TEXTS + (extra or [])
+    seed = SAMPLE_TEXTS + (extra or [])
+    rows: list[str] = []
+    index = 0
+    while len(rows) < max(min_rows, len(seed)):
+        base = seed[index % len(seed)]
+        cycle = index // len(seed)
+        rows.append(base if cycle == 0 else f"{base} Expand the answer with one extra example. [v{cycle + 1}]")
+        index += 1
     with path.open("w", encoding="utf-8") as handle:
         for text in rows:
             handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
@@ -93,16 +108,26 @@ def overlay_qwen38_configs(out_dir: Path, repo_root: Path | None = None) -> Path
     return out_dir
 
 
-def bitsandbytes_config(dtype: str = "bfloat16"):
+def gpu_free_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    free, _total = torch.cuda.mem_get_info()
+    return free / (1024**3)
+
+
+def bitsandbytes_config(dtype: str = "bfloat16", cpu_offload: bool = False):
     from transformers import BitsAndBytesConfig
 
     compute = torch.bfloat16 if dtype == "bfloat16" and torch.cuda.is_bf16_supported() else torch.float16
-    return BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=compute,
-    )
+    kwargs = {
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_use_double_quant": True,
+        "bnb_4bit_compute_dtype": compute,
+    }
+    if cpu_offload:
+        kwargs["llm_int8_enable_fp32_cpu_offload"] = True
+    return BitsAndBytesConfig(**kwargs)
 
 
 def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
@@ -110,22 +135,50 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
 
     kwargs = {
         "trust_remote_code": True,
-        "device_map": "auto",
         "low_cpu_mem_usage": True,
     }
     if fourbit:
-        kwargs["quantization_config"] = bitsandbytes_config(dtype)
+        free = gpu_free_gb()
+        print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  cpu_offload=True")
+        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=True)
+        kwargs["device_map"] = "auto"
+        if torch.cuda.is_available():
+            budget = max(free - 2.0, 8.0)
+            kwargs["max_memory"] = {0: f"{budget:.1f}GiB", "cpu": "80GiB"}
     else:
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-        kwargs["torch_dtype"] = torch_dtype
-    return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        kwargs["device_map"] = "auto"
+        kwargs["torch_dtype"] = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except ValueError as exc:
+        message = str(exc)
+        if "CPU or the disk" not in message and "cpu or the disk" not in message.lower():
+            raise
+        print("Retrying 4-bit load with explicit CPU offload after dispatch error")
+        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=True)
+        kwargs["device_map"] = "auto"
+        if torch.cuda.is_available():
+            kwargs["max_memory"] = {0: f"{max(gpu_free_gb() - 2.0, 6.0):.1f}GiB", "cpu": "80GiB"}
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
 
 
-def free_model(model) -> None:
-    del model
+def free_model(model=None) -> None:
+    if model is not None:
+        try:
+            model.cpu()
+        except Exception:
+            pass
+        del model
+    gc.collect()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        torch.cuda.synchronize()
+    print(f"GPU free after unload: {gpu_free_gb():.1f} GiB")
 
 
 def run_tiny_pipeline(steps: int = 20, seq_len: int = 64, device: str | None = None) -> dict:
@@ -180,17 +233,31 @@ def collect_teacher_logits(
 
     from scripts.distill_from_qwen38 import iter_texts
 
+    out_dir = out_path if out_path.suffix == "" else out_path.with_suffix("")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(out_dir.glob("*.pt"))
+    if existing:
+        print(f"Reusing {len(existing)} teacher batches in {out_dir}")
+        return out_dir
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id or teacher_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     teacher = load_causal_lm(teacher_id, fourbit=fourbit)
     teacher.eval()
-    device = next(teacher.parameters()).device
-    out_dir = out_path if out_path.suffix == "" else out_path.with_suffix("")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    device = next(p for p in teacher.parameters() if p.device.type != "meta").device
+
+    texts = [text for text in iter_texts(data_path) if text and text.strip()]
+    if not texts:
+        raise RuntimeError(f"No distillation texts in {data_path}")
 
     n = 0
-    for text in iter_texts(data_path):
+    cursor = 0
+    attempts = 0
+    while n < max_samples and attempts < max_samples * 4:
+        text = texts[cursor % len(texts)]
+        cursor += 1
+        attempts += 1
         encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len, padding=False)
         if encoded["input_ids"].size(-1) < 8:
             continue
@@ -207,8 +274,6 @@ def collect_teacher_logits(
         )
         n += 1
         print(f"teacher logits {n}/{max_samples}  seq={encoded['input_ids'].size(-1)}")
-        if n >= max_samples:
-            break
     if n == 0:
         raise RuntimeError("No usable distillation samples")
     free_model(teacher)
@@ -242,7 +307,7 @@ def distill_student_from_logits(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     overlay_qwen38_configs(out_dir, repo_root)
-
+    free_model()
     student = load_causal_lm(student_id, fourbit=fourbit)
     if lora:
         student = prepare_model_for_kbit_training(student)
@@ -259,7 +324,8 @@ def distill_student_from_logits(
         student.print_trainable_parameters()
     student.train()
     optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=lr)
-    device = next(p for p in student.parameters() if p.device.type != "meta").device
+    embed = student.get_input_embeddings()
+    device = embed.weight.device if embed is not None else next(p for p in student.parameters() if p.device.type != "meta").device
 
     batches = list(_iter_saved_batches(logits_path))
     if not batches:
