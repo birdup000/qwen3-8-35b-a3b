@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""High-quality Colab distill: 3.8 thinking on the 35B-A3B runtime.
+"""High-quality Colab distill onto the 35B-A3B MoE runtime.
 
-Stage A: SFT on an open instruct/reasoning mix (no teacher GPU).
-Stage B: Qwen3.8-27B generates thinking traces to jsonl (resumable).
-Stage C: response-only CE + compact top-k KL on those traces.
+Stage A: SFT on r0b0tlab Qwen3.8-Max / GLM-5.2 / Kimi K3 traces (or the
+legacy UltraChat open mix). No teacher GPU.
+Stage B (optional): generate traces from open Qwen3.8-27B.
+Stage C (optional): response-only CE + compact top-k KL on those traces.
 
-This will not match 27B dense quality on a 40GB A100. It is the strongest
-Drive-resumable recipe that still decodes as qwen3_5_moe (~3B active).
+This will not match 27B dense quality on a 40GB A100. Decode stays qwen3_5_moe
+(~3B active). The default SFT corpus is not open 3.8-27B logits.
 """
 
 from __future__ import annotations
@@ -54,9 +55,27 @@ LORA_TARGET_CANDIDATES: tuple[str, ...] = (
     "gate",
 )
 
-# Streamed, permissive-leaning public mixes. Skip GSM8K/MATH/HumanEval dumps.
-# license comments are for operators, not a grant of rights.
+# Default Colab SFT corpus: frontier traces (Qwen3.8-Max-Preview, GLM-5.2, Kimi K3).
+# License is `other` (mixed upstream + Model Studio terms) — research use; not a
+# grant to train commercial competitors. This is NOT open Qwen3.8-27B logits.
+DEFAULT_SFT_DATASET = "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation"
+DEFAULT_SFT_CONFIG = "sft_balanced"
+
 STAGE_A_SOURCES: tuple[dict[str, str], ...] = (
+    {
+        "id": DEFAULT_SFT_DATASET,
+        "name": DEFAULT_SFT_CONFIG,
+        "split": "train",
+        "kind": "messages_flexible",
+        "license": "other",
+        "skip_contamination_filter": "1",
+        "shuffle_buffer": "4096",
+    },
+)
+
+# Previous generic mix (UltraChat / SlimOrca / CodeFeedback). Use --sft-dataset "" or
+# STAGE_A_OPENMIX_SOURCES if you want that instead of the Max/GLM/Kimi corpus.
+STAGE_A_OPENMIX_SOURCES: tuple[dict[str, str], ...] = (
     {
         "id": "HuggingFaceH4/ultrachat_200k",
         "split": "train_sft",
@@ -136,12 +155,26 @@ def looks_contaminated(text: str, source: str = "") -> bool:
     return any(marker in blob for marker in CONTAMINATION_MARKERS)
 
 
+def _turn_content(item: dict[str, Any]) -> str:
+    """Flatten HF chat structs: content + reasoning_content + tool_calls."""
+    raw_content = item.get("content")
+    if raw_content is None:
+        raw_content = item.get("value")
+    content = "" if raw_content is None else str(raw_content).strip()
+    reasoning = item.get("reasoning_content")
+    reasoning = "" if not isinstance(reasoning, str) else reasoning.strip()
+    if reasoning and "<think>" not in content:
+        content = f"<think>\n{reasoning}\n</think>\n{content}".strip()
+    calls = item.get("tool_calls") or []
+    if isinstance(calls, list) and calls:
+        blob = json.dumps(calls, ensure_ascii=False)
+        if blob not in content:
+            content = f"{content}\n[tool_calls]\n{blob}".strip() if content else f"[tool_calls]\n{blob}"
+    return content
+
+
 def extract_messages(row: dict[str, Any], kind: str) -> list[dict[str, str]] | None:
-    if kind == "messages":
-        raw = row.get("messages") or row.get("conversation")
-    elif kind == "conversations":
-        raw = row.get("conversations") or row.get("conversation")
-    elif kind == "instruction":
+    if kind == "instruction":
         instruction = (row.get("instruction") or row.get("query") or "").strip()
         output = (row.get("output") or row.get("response") or row.get("answer") or "").strip()
         if not instruction or not output:
@@ -150,8 +183,19 @@ def extract_messages(row: dict[str, Any], kind: str) -> list[dict[str, str]] | N
             {"role": "user", "content": instruction},
             {"role": "assistant", "content": output},
         ]
+    if kind == "conversations":
+        raw = row.get("conversations") or row.get("conversation")
+    elif kind in {"messages", "messages_flexible"}:
+        raw = row.get("messages") or row.get("conversation")
+        if raw is None:
+            raw = row.get("messages_json")
     else:
         raw = row.get("messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
     if not isinstance(raw, list) or len(raw) < 2:
         return None
     messages: list[dict[str, str]] = []
@@ -159,13 +203,17 @@ def extract_messages(row: dict[str, Any], kind: str) -> list[dict[str, str]] | N
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or item.get("from") or "").lower()
-        content = str(item.get("content") or item.get("value") or "").strip()
+        content = _turn_content(item)
         if role in {"human", "user", "prompt"}:
             role = "user"
         elif role in {"gpt", "assistant", "model"}:
             role = "assistant"
         elif role == "system":
             role = "system"
+        elif role in {"tool", "function"}:
+            role = "user"
+            if content:
+                content = f"[tool]\n{content}"
         else:
             continue
         if content:
@@ -385,7 +433,50 @@ def hq_progress(
     }
 
 
-def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterator[dict[str, Any]]:
+def resolve_stage_a_sources(
+    sft_dataset: str | None = None,
+    sft_config: str | None = None,
+) -> tuple[dict[str, str], ...]:
+    if sft_dataset == "":
+        return STAGE_A_OPENMIX_SOURCES
+    if sft_dataset:
+        return (
+            {
+                "id": sft_dataset,
+                "name": sft_config or DEFAULT_SFT_CONFIG,
+                "split": "train",
+                "kind": "messages_flexible",
+                "license": "other",
+                "skip_contamination_filter": "1",
+                "shuffle_buffer": "4096",
+            },
+        )
+    return STAGE_A_SOURCES
+
+
+def _load_streaming_split(spec: dict[str, str]):
+    from datasets import load_dataset
+
+    kwargs: dict[str, Any] = {"split": spec.get("split") or "train", "streaming": True}
+    name = spec.get("name")
+    if name:
+        stream = load_dataset(spec["id"], name, **kwargs)
+    else:
+        stream = load_dataset(spec["id"], **kwargs)
+    buffer = int(spec.get("shuffle_buffer") or 4096)
+    if buffer > 0:
+        try:
+            stream = stream.shuffle(seed=42, buffer_size=buffer)
+        except Exception as exc:
+            print(f"Stream shuffle skipped for {spec['id']}: {exc}")
+    return stream
+
+
+def iter_stage_a_rows(
+    max_rows: int,
+    extra_jsonl: Path | None = None,
+    sources: tuple[dict[str, str], ...] | None = None,
+) -> Iterator[dict[str, Any]]:
     emitted = 0
     if extra_jsonl is not None and extra_jsonl.is_file():
         for row in iter_jsonl(extra_jsonl):
@@ -394,7 +485,7 @@ def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterato
             if emitted >= max_rows:
                 return
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset  # noqa: F401
     except ImportError:
         print("datasets not installed; using synthetic SFT rows")
         for row in synthetic_sft_rows(min(max_rows, 16)):
@@ -404,16 +495,18 @@ def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterato
                 return
         return
 
-    per_source = max((max_rows + len(STAGE_A_SOURCES) - 1) // max(len(STAGE_A_SOURCES), 1), 1)
-    for spec in STAGE_A_SOURCES:
+    specs = sources if sources is not None else STAGE_A_SOURCES
+    per_source = max((max_rows + len(specs) - 1) // max(len(specs), 1), 1)
+    for spec in specs:
         if emitted >= max_rows:
             return
         try:
-            stream = load_dataset(spec["id"], split=spec["split"], streaming=True)
+            stream = _load_streaming_split(spec)
         except Exception as exc:
             print(f"Skipping {spec['id']}: {exc}")
             continue
         taken = 0
+        skip_contam = bool(spec.get("skip_contamination_filter"))
         for raw in stream:
             if emitted >= max_rows or taken >= per_source:
                 break
@@ -421,29 +514,42 @@ def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterato
             if messages is None:
                 continue
             user_blob = " ".join(m["content"] for m in messages if m["role"] == "user")
-            if looks_contaminated(user_blob, spec["id"]):
+            if not skip_contam and looks_contaminated(user_blob, spec["id"]):
                 continue
+            row_id = str(raw.get("id") or raw.get("parent_id") or f"{spec['id']}:{taken}")
             yield {
-                "id": f"{spec['id']}:{taken}",
+                "id": row_id,
                 "source": spec["id"],
-                "license": spec["license"],
+                "license": spec.get("license", ""),
+                "teacher": str(raw.get("teacher_model") or ""),
+                "domain": str(raw.get("domain") or ""),
                 "messages": messages,
             }
             taken += 1
             emitted += 1
     if emitted == 0:
-        print("No streamed rows; falling back to synthetic SFT")
-        yield from synthetic_sft_rows(min(max_rows, 16))
+        ids = [spec["id"] for spec in specs]
+        raise RuntimeError(
+            f"No Stage A rows from {ids}. Log in to Hugging Face (HF_TOKEN) and confirm "
+            "the dataset id / config exist."
+        )
 
 
-def collect_stage_a_jsonl(path: Path, max_rows: int, extra_jsonl: Path | None = None) -> Path:
+def collect_stage_a_jsonl(
+    path: Path,
+    max_rows: int,
+    extra_jsonl: Path | None = None,
+    sources: tuple[dict[str, str], ...] | None = None,
+) -> Path:
     """Write (or resume) Stage A rows. Existing ids are kept."""
     path.parent.mkdir(parents=True, exist_ok=True)
     have = existing_trace_ids(path)
     if len(have) >= max_rows or (max_rows >= 1000 and len(have) >= max_rows - 3):
         print(f"Reusing {len(have)} Stage A rows in {path}")
         return path
-    for row in iter_stage_a_rows(max_rows, extra_jsonl=extra_jsonl):
+    specs = sources if sources is not None else STAGE_A_SOURCES
+    print(f"Collecting Stage A from {[spec['id'] for spec in specs]}  target={max_rows}")
+    for row in iter_stage_a_rows(max_rows, extra_jsonl=extra_jsonl, sources=specs):
         if row["id"] in have:
             continue
         append_jsonl(path, row)
@@ -554,6 +660,8 @@ def stage_a_sft(
     lora_r: int = 32,
     fourbit: bool = True,
     extra_jsonl: Path | None = None,
+    sft_dataset: str | None = None,
+    sft_config: str | None = None,
     repo_root: Path | None = None,
 ) -> dict[str, Path]:
     from transformers import AutoTokenizer
@@ -562,7 +670,18 @@ def stage_a_sft(
 
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    rows_path = collect_stage_a_jsonl(work_dir / "stage_a.jsonl", max_rows, extra_jsonl=extra_jsonl)
+    sources = resolve_stage_a_sources(sft_dataset, sft_config)
+    if any("qwen3.8-max" in spec["id"] for spec in sources):
+        print(
+            "SFT corpus: r0b0tlab Max/GLM/Kimi traces (not open Qwen3.8-27B). "
+            "Dataset license is `other` — noncommercial research; review Model Studio / upstream terms."
+        )
+    rows_path = collect_stage_a_jsonl(
+        work_dir / "stage_a.jsonl",
+        max_rows,
+        extra_jsonl=extra_jsonl,
+        sources=sources,
+    )
     adapter_dir = work_dir / "adapter"
     overlay_qwen38_configs(adapter_dir, repo_root)
     state_path = adapter_dir / "state.json"
@@ -594,6 +713,8 @@ def stage_a_sft(
                 lora_r=lora_r,
                 fourbit=fourbit,
                 extra_jsonl=extra_jsonl,
+                sft_dataset=sft_dataset,
+                sft_config=sft_config,
                 repo_root=repo_root,
             )
         raise RuntimeError("No tokenized Stage A examples")
@@ -662,6 +783,8 @@ def stage_a_sft(
             lora_r=lora_r,
             fourbit=fourbit,
             extra_jsonl=extra_jsonl,
+            sft_dataset=sft_dataset,
+            sft_config=sft_config,
             repo_root=repo_root,
         )
 
@@ -908,10 +1031,20 @@ def run_hq_pipeline(
     max_new_tokens: int = 1024,
     fourbit: bool = True,
     extra_jsonl: Path | None = None,
+    sft_dataset: str | None = None,
+    sft_config: str | None = None,
+    skip_stage_b: bool | None = None,
+    skip_stage_c: bool | None = None,
     repo_root: Path | None = None,
 ) -> dict[str, Path]:
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+    sources = resolve_stage_a_sources(sft_dataset, sft_config)
+    using_maxmix = any("qwen3.8-max" in spec["id"] for spec in sources)
+    if skip_stage_b is None:
+        skip_stage_b = using_maxmix
+    if skip_stage_c is None:
+        skip_stage_c = using_maxmix
     print("HQ distill: reload this process after disconnect; Drive/work_dir checkpoints resume automatically.")
     a = stage_a_sft(
         student_id=student_id,
@@ -921,16 +1054,27 @@ def run_hq_pipeline(
         seq_len=seq_len,
         fourbit=fourbit,
         extra_jsonl=extra_jsonl,
+        sft_dataset=sft_dataset,
+        sft_config=sft_config,
         repo_root=repo_root,
     )
-    b = stage_b_traces(
-        teacher_id=teacher_id,
-        work_dir=work_dir,
-        max_traces=max_traces,
-        max_new_tokens=max_new_tokens,
-        seq_len=seq_len,
-        fourbit=fourbit,
-    )
+    if skip_stage_b:
+        print("Skipping Stage B (27B teacher generate). SFT traces already come from the dataset.")
+        result = {"adapter": a["adapter"], "stage_a": a["rows"]}
+        if skip_stage_c:
+            return result
+    else:
+        b = stage_b_traces(
+            teacher_id=teacher_id,
+            work_dir=work_dir,
+            max_traces=max_traces,
+            max_new_tokens=max_new_tokens,
+            seq_len=seq_len,
+            fourbit=fourbit,
+        )
+        result = {"adapter": a["adapter"], "stage_a": a["rows"], "traces": b["traces"], "topk": b["topk"]}
+    if skip_stage_c:
+        return result
     c = stage_c_align(
         student_id=student_id,
         work_dir=work_dir,
@@ -939,7 +1083,9 @@ def run_hq_pipeline(
         fourbit=fourbit,
         repo_root=repo_root,
     )
-    return {"adapter": c["adapter"], "stage_a": a["rows"], "traces": b["traces"], "topk": b["topk"]}
+    result["adapter"] = c["adapter"]
+    result["traces"] = c["traces"]
+    return result
 
 
 def main() -> None:
@@ -955,13 +1101,17 @@ def main() -> None:
     parser.add_argument("--stage-a-steps", type=int, default=None)
     parser.add_argument("--stage-c-steps", type=int, default=4000)
     parser.add_argument("--data", help="Optional extra jsonl of {messages:[...]}")
+    parser.add_argument("--sft-dataset", default=DEFAULT_SFT_DATASET, help="HF dataset id for Stage A. Empty string = UltraChat open mix.")
+    parser.add_argument("--sft-config", default=DEFAULT_SFT_CONFIG)
     parser.add_argument("--no-fourbit", action="store_true")
     args = parser.parse_args()
     work = Path(args.work_dir)
     extra = Path(args.data) if args.data else None
     fourbit = not args.no_fourbit
+    sft_dataset = args.sft_dataset
+    sft_config = args.sft_config
     if args.stage == "a":
-        print(stage_a_sft(student_id=args.student, work_dir=work, max_rows=args.max_rows, steps=args.stage_a_steps, seq_len=args.seq_len, extra_jsonl=extra, fourbit=fourbit))
+        print(stage_a_sft(student_id=args.student, work_dir=work, max_rows=args.max_rows, steps=args.stage_a_steps, seq_len=args.seq_len, extra_jsonl=extra, sft_dataset=sft_dataset, sft_config=sft_config, fourbit=fourbit))
     elif args.stage == "b":
         print(stage_b_traces(teacher_id=args.teacher, work_dir=work, max_traces=args.max_traces, max_new_tokens=args.max_new_tokens, seq_len=args.seq_len, fourbit=fourbit))
     elif args.stage == "c":
@@ -980,6 +1130,8 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 fourbit=fourbit,
                 extra_jsonl=extra,
+                sft_dataset=sft_dataset,
+                sft_config=sft_config,
             )
         )
 

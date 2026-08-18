@@ -50,12 +50,14 @@ python scripts/export_hf.py \
 High-quality Colab / Drive-resumable distill:
 
 ```bash
-python scripts/hq_distill.py --stage a --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --max-rows 10000
-python scripts/hq_distill.py --stage b --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --max-traces 5000
-python scripts/hq_distill.py --stage c --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --stage-c-steps 4000
+python scripts/hq_distill.py --stage a \
+  --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq_maxmix \
+  --max-rows 16000 --stage-a-steps 4000 \
+  --sft-dataset r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation \
+  --sft-config sft_balanced
 ```
 
-Same flags scale up on an 80GB box (`--max-traces 50000 --seq-len 4096`). Optional `--data` jsonl of `{"messages":[...]}` is for extra traces you already have; this repo does not default to third-party 3.8-Max dumps.
+Default Stage A is [`r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation`](https://huggingface.co/datasets/r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation) (`sft_balanced`): Qwen3.8-Max-Preview + GLM-5.2 + Kimi K3 traces, **not** open Qwen3.8-27B logits. License on that dataset is `other` (mixed upstream + Model Studio terms) — treat as **noncommercial research**. Stage B/C (27B generate + top-k KD) stay off unless you pass `--stage b` / `--stage c`. UltraChat mix: `--sft-dataset ""`. Use a **new** work dir (`hq_maxmix`); do not reuse an UltraChat `hq/` jsonl.
 
 ```bash
 python scripts/export_gguf.py \
@@ -130,17 +132,16 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
 
-The Colab is the **high-quality path only**: Stage A SFT on an open mix, Stage B `Qwen3.8-27B` traces on Drive, Stage C response CE + top-k KL, then Unsloth-style `UD-Q4_K_XL` GGUF. Broad LoRA (attention + DeltaNet + shared expert + router). Re-run section 5 after a disconnect; checkpoints on Drive resume. A 40GB A100 will not match 27B dense MMLU; decode stays 35B-A3B (~3B active). Rent an 80GB GPU and raise `--max-traces` / `--seq-len` on the same script if you want closer to on-par.
+The Colab is **Stage A SFT** of the 35B-A3B on the Max/GLM/Kimi corpus (Drive `hq_maxmix`), then Unsloth-style `UD-Q4_K_XL` GGUF. Broad LoRA (attention + DeltaNet + shared expert). Re-run section 5 after a disconnect; checkpoints resume. This is **not** 27B-dense parity and **not** open Qwen3.8-27B KD — frozen experts stay 3.6, decode stays ~3B active. Optional `--stage b` / `--stage c` if you still want 27B KL.
 
 | HQ stage (cached weights) | A100 40GB ballpark |
 | --- | --- |
-| A: SFT 10k×2048 | 8–16 h |
-| B: 5k traces×1024 | 15–40 h (resume on Drive) |
-| C: 2 epochs on traces | 8–16 h |
+| A: SFT 16k rows, 4000×2048 (CPU expert paging) | 10–40 h |
+| B / C | skipped (traces already in the dataset) |
 | GGUF `UD-Q4_K_XL` | 2–4 h |
 
 After distill, section 8 merges the HQ LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
 
 ## License
 
-Apache-2.0. Architecture and serving compatibility follow the Qwen3.5 / Qwen3.6 / Qwen3.8 open releases.
+Apache-2.0. Architecture and serving compatibility follow the Qwen3.5 / Qwen3.6 / Qwen3.8 open releases. The default Colab SFT corpus (`r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation`) is separately licensed (`other`) and is **not** covered by this Apache-2.0 grant.

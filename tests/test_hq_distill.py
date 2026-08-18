@@ -4,7 +4,10 @@ import torch
 
 from qwen3_8_moe.chat import Qwen38ChatFormatter
 from scripts.hq_distill import (
+    DEFAULT_SFT_CONFIG,
+    DEFAULT_SFT_DATASET,
     LORA_TARGET_CANDIDATES,
+    STAGE_A_OPENMIX_SOURCES,
     append_jsonl,
     existing_trace_ids,
     extract_messages,
@@ -12,6 +15,7 @@ from scripts.hq_distill import (
     looks_contaminated,
     pack_topk_logits,
     resolve_lora_targets,
+    resolve_stage_a_sources,
     synthetic_sft_rows,
     unpack_topk_kd_loss,
 )
@@ -53,6 +57,37 @@ def test_synthetic_rows_and_extractors():
     assert chat[-1]["content"] == "Hello"
     assert conv[0]["role"] == "user"
     assert instr is not None and "return a+b" in instr[-1]["content"]
+
+    as_json = extract_messages(
+        {
+            "messages_json": (
+                '[{"role":"user","content":"2+2"},'
+                '{"role":"assistant","content":"4","reasoning_content":"add them"}]'
+            )
+        },
+        "messages_flexible",
+    )
+    assert as_json is not None
+    assert "<think>" in as_json[-1]["content"]
+    assert "add them" in as_json[-1]["content"]
+    assert as_json[-1]["content"].endswith("4")
+
+    toolish = extract_messages(
+        {
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {"role": "assistant", "content": "", "tool_calls": [{"name": "ls"}]},
+                {"role": "tool", "content": "a.py"},
+                {"role": "assistant", "content": "one file"},
+            ]
+        },
+        "messages_flexible",
+    )
+    assert toolish is not None
+    assert "[tool_calls]" in toolish[1]["content"]
+    assert toolish[2]["role"] == "user"
+    assert toolish[2]["content"].startswith("[tool]")
+    assert toolish[-1]["content"] == "one file"
 
 
 def test_resume_skips_existing_trace_ids(tmp_path: Path):
@@ -126,6 +161,18 @@ def test_contamination_filter():
     assert looks_contaminated("solve this", source="gsm8k")
     assert looks_contaminated("OpenAI HumanEval prompt")
     assert not looks_contaminated("Write a FastAPI endpoint", source="ultrachat")
+
+
+def test_resolve_stage_a_sources_defaults_to_maxmix():
+    default = resolve_stage_a_sources()
+    assert default[0]["id"] == DEFAULT_SFT_DATASET
+    assert default[0]["name"] == DEFAULT_SFT_CONFIG
+    assert default[0]["skip_contamination_filter"] == "1"
+    assert resolve_stage_a_sources("") is STAGE_A_OPENMIX_SOURCES
+    custom = resolve_stage_a_sources("org/other", "sft_tools")
+    assert custom[0]["id"] == "org/other"
+    assert custom[0]["name"] == "sft_tools"
+    assert custom[0]["kind"] == "messages_flexible"
 
 
 def test_collect_stage_a_resumes(tmp_path: Path):

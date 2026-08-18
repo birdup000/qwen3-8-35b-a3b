@@ -19,6 +19,9 @@ def test_colab_notebook_is_hq_distill_and_gguf_only():
     assert "run_hq_pipeline" in text
     assert "export_unsloth_xl_gguf" in text
     assert "UD-Q4_K_XL" in text
+    assert "hq_maxmix" in text
+    assert "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation" in text
+    assert "sft_balanced" in text
     assert "run_full_pipeline" not in text
     assert "Smoke distill" not in text
     assert "64 short prompts" not in text
