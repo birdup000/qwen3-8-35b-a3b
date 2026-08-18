@@ -45,7 +45,19 @@ python scripts/distill_from_qwen38.py \
 python scripts/export_hf.py \
   --src checkpoints/Qwen3.8-35B-A3B-distilled \
   --out checkpoints/Qwen3.8-35B-A3B-hf
+```
 
+High-quality Colab / Drive-resumable distill (not the 64-sample smoke test):
+
+```bash
+python scripts/hq_distill.py --stage a --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --max-rows 10000
+python scripts/hq_distill.py --stage b --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --max-traces 5000
+python scripts/hq_distill.py --stage c --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --stage-c-steps 4000
+```
+
+Same flags scale up on an 80GB box (`--max-traces 50000 --seq-len 4096`). Optional `--data` jsonl of `{"messages":[...]}` is for extra traces you already have; this repo does not default to third-party 3.8-Max dumps.
+
+```bash
 python scripts/export_gguf.py \
   --lora checkpoints/Qwen3.8-35B-A3B-lora \
   --work-dir /tmp/qwen38_gguf \
@@ -116,7 +128,18 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 [Open in Colab](https://colab.research.google.com/github/birdup000/qwen3-8-35b-a3b/blob/main/notebooks/Qwen3.8-35B-A3B_Colab.ipynb)
 
-Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16. After distill, section 8 merges the LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
+Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
+
+**Distill quality.** Section 5 is a 64-sample smoke test (~1–2 h). Section 5b is the 3.8-quality path: Stage A SFT on an open mix, Stage B `Qwen3.8-27B` traces on Drive, Stage C response CE + top-k KL, broad LoRA (attention + DeltaNet + shared expert + router). Expect several Colab sessions. A 40GB A100 will not match 27B dense MMLU; decode stays 35B-A3B (~3B active). Rent an 80GB GPU and raise `--max-traces` / `--seq-len` on the same script if you want closer to on-par.
+
+| HQ stage (cached weights) | A100 40GB ballpark |
+| --- | --- |
+| A: SFT 10k×2048 | 8–16 h |
+| B: 5k traces×1024 | 15–40 h (resume on Drive) |
+| C: 2 epochs on traces | 8–16 h |
+| GGUF `UD-Q4_K_XL` | 2–4 h |
+
+After distill, section 8 merges the LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
 
 ## License
 

@@ -25,6 +25,9 @@ colab = [
     "safetensors",
     "huggingface_hub",
     "sentencepiece",
+    "datasets",
+    "trl",
+    "packaging",
     "pytest",
 ]
 dev = ["pytest"]

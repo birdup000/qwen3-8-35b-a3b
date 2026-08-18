@@ -443,6 +443,44 @@ def export_unsloth_xl_gguf(
     )
 
 
+def run_hq_stage_a(**kwargs):
+    from scripts.hq_distill import stage_a_sft
+
+    return stage_a_sft(**kwargs)
+
+
+def run_hq_stage_b(**kwargs):
+    from scripts.hq_distill import stage_b_traces
+
+    return stage_b_traces(**kwargs)
+
+
+def run_hq_stage_c(**kwargs):
+    from scripts.hq_distill import stage_c_align
+
+    return stage_c_align(**kwargs)
+
+
+def run_hq_pipeline(**kwargs):
+    """Drive-resumable 3.8-quality distill. Reload after Colab disconnects."""
+    from scripts.hq_distill import run_hq_pipeline as _run
+
+    return _run(**kwargs)
+
+
+def try_install_flash_delta() -> dict[str, str]:
+    """Best-effort FLA / causal-conv1d install. Missing wheels must not abort Colab."""
+    results: dict[str, str] = {}
+    for package in ("causal-conv1d", "flash-linear-attention"):
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
+            results[package] = "installed"
+        except Exception as exc:
+            results[package] = f"skip: {exc}"
+            print(f"Optional {package} not installed ({exc}). DeltaNet stays on the torch fallback.")
+    return results
+
+
 def export_hf_snapshot(src: Path, out: Path, yarn: bool = False) -> Path:
     cmd = [sys.executable, str(REPO_ROOT / "scripts" / "export_hf.py"), "--src", str(src), "--out", str(out)]
     if yarn:

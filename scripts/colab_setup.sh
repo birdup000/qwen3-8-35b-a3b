@@ -23,6 +23,15 @@ cd "${DEST}"
 python3 -m pip install -q -U pip
 python3 -m pip install -q -e ".[colab]"
 python3 - <<'PY'
+import subprocess, sys
+for package in ("causal-conv1d", "flash-linear-attention"):
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
+        print("optional", package, "installed")
+    except Exception as exc:
+        print("optional", package, "skipped:", exc)
+PY
+python3 - <<'PY'
 from qwen3_8_moe import qwen38_35b_a3b_config, parameter_report
 cfg = qwen38_35b_a3b_config().text_config
 assert (cfg.hidden_size, cfg.num_hidden_layers, cfg.num_experts) == (2048, 40, 256)
