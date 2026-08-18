@@ -454,15 +454,48 @@ def resolve_stage_a_sources(
     return STAGE_A_SOURCES
 
 
+def parquet_shard_paths(repo_id: str, config: str, split: str, files: Iterable[str]) -> list[str]:
+    """Keep only `data/{config}/{split}-*.parquet` — Hub YAML for this corpus has no data_files."""
+    prefix = f"data/{config}/{split}-"
+    return sorted(
+        f"hf://datasets/{repo_id}/{path.lstrip('/')}"
+        for path in files
+        if path.replace("\\", "/").startswith(prefix) and path.endswith(".parquet")
+    )
+
+
+def _list_config_parquet_shards(repo_id: str, config: str, split: str) -> list[str]:
+    from huggingface_hub import list_repo_files
+
+    return parquet_shard_paths(repo_id, config, split, list_repo_files(repo_id, repo_type="dataset"))
+
+
+def _load_named_parquet_shards(repo_id: str, config: str, split: str):
+    """Load one Hub config via its parquet folder so mixed-schema datasets do not CastError."""
+    from datasets import load_dataset
+
+    shards = _list_config_parquet_shards(repo_id, config, split)
+    if not shards:
+        pattern = f"hf://datasets/{repo_id}/data/{config}/{split}-*.parquet"
+        print(f"No listed shards for {repo_id} {config}/{split}; trying glob {pattern}")
+        return load_dataset("parquet", data_files=pattern, split="train", streaming=True)
+    print(f"Loading {len(shards)} parquet shards from data/{config}/{split}-*.parquet")
+    return load_dataset("parquet", data_files=shards, split="train", streaming=True)
+
+
 def _load_streaming_split(spec: dict[str, str]):
     from datasets import load_dataset
 
-    kwargs: dict[str, Any] = {"split": spec.get("split") or "train", "streaming": True}
+    split = spec.get("split") or "train"
     name = spec.get("name")
     if name:
-        stream = load_dataset(spec["id"], name, **kwargs)
+        try:
+            stream = _load_named_parquet_shards(spec["id"], name, split)
+        except Exception as exc:
+            print(f"Parquet-folder load failed for {spec['id']}/{name}: {exc}; trying Hub config")
+            stream = load_dataset(spec["id"], name, split=split, streaming=True)
     else:
-        stream = load_dataset(spec["id"], **kwargs)
+        stream = load_dataset(spec["id"], split=split, streaming=True)
     buffer = int(spec.get("shuffle_buffer") or 4096)
     if buffer > 0:
         try:
@@ -507,26 +540,31 @@ def iter_stage_a_rows(
             continue
         taken = 0
         skip_contam = bool(spec.get("skip_contamination_filter"))
-        for raw in stream:
-            if emitted >= max_rows or taken >= per_source:
-                break
-            messages = extract_messages(raw, spec["kind"])
-            if messages is None:
-                continue
-            user_blob = " ".join(m["content"] for m in messages if m["role"] == "user")
-            if not skip_contam and looks_contaminated(user_blob, spec["id"]):
-                continue
-            row_id = str(raw.get("id") or raw.get("parent_id") or f"{spec['id']}:{taken}")
-            yield {
-                "id": row_id,
-                "source": spec["id"],
-                "license": spec.get("license", ""),
-                "teacher": str(raw.get("teacher_model") or ""),
-                "domain": str(raw.get("domain") or ""),
-                "messages": messages,
-            }
-            taken += 1
-            emitted += 1
+        try:
+            for raw in stream:
+                if emitted >= max_rows or taken >= per_source:
+                    break
+                messages = extract_messages(raw, spec["kind"])
+                if messages is None:
+                    continue
+                user_blob = " ".join(m["content"] for m in messages if m["role"] == "user")
+                if not skip_contam and looks_contaminated(user_blob, spec["id"]):
+                    continue
+                row_id = str(raw.get("id") or raw.get("parent_id") or f"{spec['id']}:{taken}")
+                yield {
+                    "id": row_id,
+                    "source": spec["id"],
+                    "license": spec.get("license", ""),
+                    "teacher": str(raw.get("teacher_model") or ""),
+                    "domain": str(raw.get("domain") or ""),
+                    "messages": messages,
+                }
+                taken += 1
+                emitted += 1
+        except Exception as exc:
+            print(f"Stopped reading {spec['id']} ({spec.get('name') or 'default'}): {exc}")
+            if taken == 0:
+                raise
     if emitted == 0:
         ids = [spec["id"] for spec in specs]
         raise RuntimeError(

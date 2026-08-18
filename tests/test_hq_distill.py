@@ -14,6 +14,7 @@ from scripts.hq_distill import (
     format_sft_row,
     looks_contaminated,
     pack_topk_logits,
+    parquet_shard_paths,
     resolve_lora_targets,
     resolve_stage_a_sources,
     synthetic_sft_rows,
@@ -173,6 +174,25 @@ def test_resolve_stage_a_sources_defaults_to_maxmix():
     assert custom[0]["id"] == "org/other"
     assert custom[0]["name"] == "sft_tools"
     assert custom[0]["kind"] == "messages_flexible"
+
+
+def test_parquet_shard_paths_keeps_one_config():
+    files = [
+        "data/sft_science/train-00001-of-00002.parquet",
+        "data/sft_dialogue/train-00000-of-00001.parquet",
+        "data/prompt_completion_text/train-00001-of-00005.parquet",
+        "data/canonical/train-00000-of-00005.parquet",
+        "data/sft_balanced/train-00000-of-00006.parquet",
+        "data/sft_balanced/train-00001-of-00006.parquet",
+        "data/sft_balanced/validation-00000-of-00001.parquet",
+        "README.md",
+    ]
+    repo = "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation"
+    got = parquet_shard_paths(repo, "sft_balanced", "train", files)
+    assert got == [
+        f"hf://datasets/{repo}/data/sft_balanced/train-00000-of-00006.parquet",
+        f"hf://datasets/{repo}/data/sft_balanced/train-00001-of-00006.parquet",
+    ]
 
 
 def test_collect_stage_a_resumes(tmp_path: Path):
