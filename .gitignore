@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# checkpoints and downloaded weights
+checkpoints/
+weights/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+tokenizer.json
+tokenizer.model
+
+# local env
+.env
+.hf_token

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-8-35b-a3b"
+version = "0.1.0"
+description = "Qwen3.8-35B-A3B: Qwen3.8 hybrid intelligence on the Qwen3.6-35B-A3B MoE runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Qwen3.8-35B-A3B contributors" }]
+dependencies = [
+    "torch>=2.4",
+]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.51", "huggingface_hub", "safetensors", "accelerate"]
+serve = ["transformers>=4.51", "safetensors"]
+colab = [
+    "transformers>=5.2.0",
+    "accelerate",
+    "bitsandbytes",
+    "peft",
+    "safetensors",
+    "huggingface_hub",
+    "sentencepiece",
+    "pytest",
+]
+dev = ["pytest"]
+
+[project.scripts]
+qwen38-generate = "scripts.generate:main"
+qwen38-count-params = "scripts.count_params:main"
+
+[tool.setuptools.packages.find]
+include = ["qwen3_8_moe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,17 @@
+{
+  "add_bos_token": false,
+  "add_eos_token": false,
+  "bos_token": "<|endoftext|>",
+  "eos_token": "<|endoftext|>",
+  "pad_token": "<|endoftext|>",
+  "unk_token": null,
+  "model_max_length": 262144,
+  "tokenizer_class": "Qwen2Tokenizer",
+  "extra_special_tokens": {
+    "image_token": "<|image_pad|>",
+    "video_token": "<|video_pad|>",
+    "vision_start_token": "<|vision_start|>",
+    "vision_end_token": "<|vision_end|>"
+  },
+  "chat_template": "{%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}{%- set preserve_thinking = preserve_thinking if preserve_thinking is defined else true -%}{%- set reasoning_effort = reasoning_effort if reasoning_effort is defined else 'xhigh' -%}{%- if messages[0]['role'] != 'system' -%}{%- set messages = [{'role': 'system', 'content': 'You are Qwen3.8-35B-A3B, a helpful multimodal assistant.'}] + messages -%}{%- endif -%}{%- for message in messages -%}{%- set content = message['content'] -%}{%- if message['role'] == 'assistant' and not preserve_thinking -%}{%- set content = content | regex_replace('<think>.*?</think>\\\\s*', '') -%}{%- endif -%}{{ '<|im_start|>' + message['role'] + '\\n' + content + '<|im_end|>\\n' }}{%- endfor -%}{%- if add_generation_prompt -%}{{ '<|im_start|>assistant\\n' }}{%- if enable_thinking -%}{{ '<think>\\n' }}{%- endif -%}{%- endif -%}"
+}
