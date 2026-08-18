@@ -278,7 +278,10 @@ def resolve_lora_targets(model: torch.nn.Module, candidates: Iterable[str] = LOR
             continue
         found.append(name)
     if skipped_3d:
-        print(f"LoRA skipped non-Linear modules ({len(skipped_3d)}), e.g. {skipped_3d[:3]}")
+        if all(name.endswith(".mlp.gate") for name in skipped_3d):
+            print(f"LoRA skipped {len(skipped_3d)} MoE routers (TopKRouter is a Parameter, not Linear)")
+        else:
+            print(f"LoRA skipped non-Linear modules ({len(skipped_3d)}), e.g. {skipped_3d[:3]}")
     if skipped_meta:
         print(f"LoRA skipped meta-weight modules ({len(skipped_meta)}), e.g. {skipped_meta[:3]}")
     if not found:
@@ -613,6 +616,13 @@ def stage_a_sft(
             (p for p in student.parameters() if p.requires_grad and p.device.type != "meta"),
             lr=lr,
         )
+        from scripts.colab_pipeline import gpu_free_gb
+
+        print(
+            f"Stage A train: steps={n_steps} seq_len={seq_len} device={device} "
+            f"free_gpu={gpu_free_gb():.1f}GiB. First forward can take several minutes "
+            "(CPU expert banks move per layer)."
+        )
 
         step = start_step
         while step < n_steps:
@@ -821,6 +831,12 @@ def stage_c_align(
         optimizer = torch.optim.AdamW(
             (p for p in student.parameters() if p.requires_grad and p.device.type != "meta"),
             lr=lr,
+        )
+        from scripts.colab_pipeline import gpu_free_gb
+
+        print(
+            f"Stage C train: steps={steps} seq_len={seq_len} device={device} "
+            f"free_gpu={gpu_free_gb():.1f}GiB. First forward can take several minutes."
         )
 
         step = c_step

@@ -104,6 +104,24 @@ def test_resolve_lora_targets_skips_non_linear():
     assert "experts_down" not in found
 
 
+def test_resolve_lora_skips_topk_router_parameter():
+    class Router(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4, 4))
+
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4, bias=False)
+            self.mlp = torch.nn.Module()
+            self.mlp.gate = Router()
+
+    found = resolve_lora_targets(Block())
+    assert "q_proj" in found
+    assert not any(name.endswith(".mlp.gate") for name in found)
+
+
 def test_contamination_filter():
     assert looks_contaminated("solve this", source="gsm8k")
     assert looks_contaminated("OpenAI HumanEval prompt")

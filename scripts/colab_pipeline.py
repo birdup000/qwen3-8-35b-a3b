@@ -325,7 +325,14 @@ def _finalize_loaded_lm(model):
     disable_generation_cache(model)
     print(describe_hf_device_map(model))
     meta = list_meta_tensors(model)
-    if meta:
+    expert_meta = [name for name in meta if ".mlp.experts." in name]
+    other_meta = [name for name in meta if name not in expert_meta]
+    if expert_meta and not other_meta:
+        print(
+            f"Expected: {len(expert_meta)} expert-bank tensors are CPU-offloaded "
+            "(accelerate keeps meta placeholders until each layer's forward)."
+        )
+    elif meta:
         print(f"Warning: {len(meta)} tensors still on meta, e.g. {meta[:6]}")
     return model
 
