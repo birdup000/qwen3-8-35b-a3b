@@ -204,6 +204,7 @@ def bitsandbytes_config(
     dtype: str = "bfloat16",
     cpu_offload: bool = False,
     double_quant: bool = True,
+    skip_modules: list[str] | None = None,
 ):
     from transformers import BitsAndBytesConfig
 
@@ -216,6 +217,8 @@ def bitsandbytes_config(
     }
     if cpu_offload:
         kwargs["llm_int8_enable_fp32_cpu_offload"] = True
+    if skip_modules:
+        kwargs["llm_int8_skip_modules"] = list(skip_modules)
     return BitsAndBytesConfig(**kwargs)
 
 
@@ -227,7 +230,7 @@ def qwen35_moe_device_map(
     extra: dict[str, str | int],
     gpu: int = 0,
 ) -> dict[str, str | int]:
-    """Keep NF4 Linears on GPU. Park packed BF16 expert banks (and vision) on CPU."""
+    """Keep NF4 Linears on GPU. Park packed BF16 expert banks on CPU."""
     device_map: dict[str, str | int] = dict(extra)
     for index in range(num_layers):
         prefix = f"{layer_prefix}.{index}"
@@ -262,7 +265,7 @@ def iter_qwen35_moe_device_maps(
                 "model.language_model.embed_tokens": gpu,
                 "model.language_model.norm": gpu,
                 "model.language_model.rotary_emb": gpu,
-                "model.visual": "cpu",
+                "model.visual": gpu,
             },
             gpu=gpu,
         ),
@@ -328,15 +331,25 @@ def _finalize_loaded_lm(model):
 
 
 def _load_moe_nf4(model_id: str, dtype: str):
-    """NF4 the GPU Linears. Never 4-bit-offload — that leaves bitsandbytes quant state on meta."""
+    """NF4 GPU Linears; leave packed expert banks in BF16 on CPU.
+
+    bitsandbytes requires llm_int8_enable_fp32_cpu_offload when any module is on
+    CPU. That flag must not put Linear4bit on CPU — only the unquantized 3D
+    expert Parameters go there.
+    """
     num_layers, layer_types = _text_layer_spec(model_id)
     last_error = ""
-    quant = bitsandbytes_config(dtype, cpu_offload=False, double_quant=False)
+    quant = bitsandbytes_config(
+        dtype,
+        cpu_offload=True,
+        double_quant=False,
+        skip_modules=["experts"],
+    )
     for index, device_map in enumerate(iter_qwen35_moe_device_maps(num_layers, layer_types)):
         cpu_mods = sum(value == "cpu" for value in device_map.values())
         print(
             f"Loading {model_id} in NF4  free_gpu={gpu_free_gb():.1f}GiB  "
-            f"experts+vision on CPU ({cpu_mods} modules, map {index + 1}/2, no 4-bit CPU offload)"
+            f"expert banks on CPU ({cpu_mods} modules, map {index + 1}/2, fp32_cpu_offload)"
         )
         load_kwargs = {
             "trust_remote_code": True,

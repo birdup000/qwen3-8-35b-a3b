@@ -34,7 +34,7 @@ def test_qwen35_moe_device_map_parks_experts_not_linears():
 
     types = (["linear_attention"] * 3 + ["full_attention"]) * 10
     vl, text = iter_qwen35_moe_device_maps(40, types)
-    assert vl["model.visual"] == "cpu"
+    assert vl["model.visual"] == 0
     assert vl["model.language_model.layers.0.mlp.experts"] == "cpu"
     assert vl["model.language_model.layers.0.linear_attn"] == 0
     assert vl["model.language_model.layers.3.self_attn"] == 0
