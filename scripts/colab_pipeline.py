@@ -518,6 +518,12 @@ def run_hq_pipeline(**kwargs):
     return _run(**kwargs)
 
 
+def hq_progress(work_dir: Path, **kwargs):
+    from scripts.hq_distill import hq_progress as _progress
+
+    return _progress(work_dir, **kwargs)
+
+
 def try_install_flash_delta() -> dict[str, str]:
     """Best-effort FLA / causal-conv1d install. Missing wheels must not abort Colab."""
     results: dict[str, str] = {}

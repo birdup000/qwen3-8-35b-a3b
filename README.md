@@ -47,7 +47,7 @@ python scripts/export_hf.py \
   --out checkpoints/Qwen3.8-35B-A3B-hf
 ```
 
-High-quality Colab / Drive-resumable distill (not the 64-sample smoke test):
+High-quality Colab / Drive-resumable distill:
 
 ```bash
 python scripts/hq_distill.py --stage a --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq --max-rows 10000
@@ -130,7 +130,7 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
 
-**Distill quality.** Section 5 is a 64-sample smoke test (~1–2 h). Section 5b is the 3.8-quality path: Stage A SFT on an open mix, Stage B `Qwen3.8-27B` traces on Drive, Stage C response CE + top-k KL, broad LoRA (attention + DeltaNet + shared expert + router). Expect several Colab sessions. A 40GB A100 will not match 27B dense MMLU; decode stays 35B-A3B (~3B active). Rent an 80GB GPU and raise `--max-traces` / `--seq-len` on the same script if you want closer to on-par.
+The Colab is the **high-quality path only**: Stage A SFT on an open mix, Stage B `Qwen3.8-27B` traces on Drive, Stage C response CE + top-k KL, then Unsloth-style `UD-Q4_K_XL` GGUF. Broad LoRA (attention + DeltaNet + shared expert + router). Re-run section 5 after a disconnect; checkpoints on Drive resume. A 40GB A100 will not match 27B dense MMLU; decode stays 35B-A3B (~3B active). Rent an 80GB GPU and raise `--max-traces` / `--seq-len` on the same script if you want closer to on-par.
 
 | HQ stage (cached weights) | A100 40GB ballpark |
 | --- | --- |
@@ -139,7 +139,7 @@ Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clone
 | C: 2 epochs on traces | 8–16 h |
 | GGUF `UD-Q4_K_XL` | 2–4 h |
 
-After distill, section 8 merges the LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
+After distill, section 8 merges the HQ LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.
 
 ## License
 

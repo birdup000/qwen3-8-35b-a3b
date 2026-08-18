@@ -337,6 +337,33 @@ def save_state(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
 
 
+def hq_progress(
+    work_dir: Path,
+    *,
+    max_rows: int = 10000,
+    max_traces: int = 5000,
+    stage_c_steps: int = 4000,
+) -> dict[str, Any]:
+    """Drive-resume snapshot for Colab: rows, traces, adapter, last stage."""
+    work_dir = Path(work_dir)
+    adapter = work_dir / "adapter"
+    state = load_state(adapter / "state.json")
+    rows = existing_trace_ids(work_dir / "stage_a.jsonl")
+    traces = existing_trace_ids(work_dir / "traces.jsonl")
+    return {
+        "dir": str(work_dir),
+        "stage": state.get("stage"),
+        "adapter": (adapter / "adapter_config.json").is_file(),
+        "stage_a_rows": len(rows),
+        "stage_a_target": max_rows,
+        "a_step": int(state.get("a_step", 0)),
+        "traces": len(traces),
+        "traces_target": max_traces,
+        "c_step": int(state.get("c_step", 0)),
+        "c_target": stage_c_steps,
+    }
+
+
 def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterator[dict[str, Any]]:
     emitted = 0
     if extra_jsonl is not None and extra_jsonl.is_file():

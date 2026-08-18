@@ -121,3 +121,20 @@ def test_collect_stage_a_resumes(tmp_path: Path):
     assert len(first) == 2
     collect_stage_a_jsonl(tmp_path / "stage_a.jsonl", max_rows=2, extra_jsonl=extra)
     assert existing_trace_ids(tmp_path / "stage_a.jsonl") == first
+
+
+def test_hq_progress_reads_drive_layout(tmp_path: Path):
+    from scripts.hq_distill import hq_progress, save_state
+
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    save_state(adapter / "state.json", {"stage": "B", "a_step": 200, "c_step": 0})
+    append_jsonl(tmp_path / "stage_a.jsonl", {"id": "row-1"})
+    append_jsonl(tmp_path / "traces.jsonl", {"id": "trace-1"})
+    progress = hq_progress(tmp_path, max_rows=10, max_traces=5, stage_c_steps=4000)
+    assert progress["adapter"] is True
+    assert progress["stage"] == "B"
+    assert progress["stage_a_rows"] == 1
+    assert progress["traces"] == 1
+    assert progress["a_step"] == 200

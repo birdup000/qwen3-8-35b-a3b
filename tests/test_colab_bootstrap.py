@@ -10,3 +10,16 @@ def test_clone_repo_keeps_existing_checkout(tmp_path):
     out = clone_repo(dest=dest)
     assert out == dest.resolve()
     assert (dest / "qwen3_8_moe" / "configuration.py").is_file()
+
+
+def test_colab_notebook_is_hq_distill_and_gguf_only():
+    from pathlib import Path
+
+    text = Path("notebooks/Qwen3.8-35B-A3B_Colab.ipynb").read_text(encoding="utf-8")
+    assert "run_hq_pipeline" in text
+    assert "export_unsloth_xl_gguf" in text
+    assert "UD-Q4_K_XL" in text
+    assert "run_full_pipeline" not in text
+    assert "Smoke distill" not in text
+    assert "64 short prompts" not in text
+    assert "section 5b" not in text
