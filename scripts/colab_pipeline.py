@@ -180,15 +180,6 @@ def _reset_cuda_after_oom() -> None:
             pass
 
 
-def _offload_folder() -> str | None:
-    root = Path("/content")
-    if not root.is_dir():
-        return None
-    path = root / "qwen38_offload"
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path)
-
-
 def list_meta_tensors(model) -> list[str]:
     names: list[str] = []
     for name, param in model.named_parameters():
@@ -209,19 +200,98 @@ def disable_generation_cache(model) -> None:
             obj.use_cache = False
 
 
-def bitsandbytes_config(dtype: str = "bfloat16", cpu_offload: bool = False):
+def bitsandbytes_config(
+    dtype: str = "bfloat16",
+    cpu_offload: bool = False,
+    double_quant: bool = True,
+):
     from transformers import BitsAndBytesConfig
 
     compute = torch.bfloat16 if dtype == "bfloat16" and torch.cuda.is_bf16_supported() else torch.float16
     kwargs = {
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_use_double_quant": True,
+        "bnb_4bit_use_double_quant": double_quant,
         "bnb_4bit_compute_dtype": compute,
     }
     if cpu_offload:
         kwargs["llm_int8_enable_fp32_cpu_offload"] = True
     return BitsAndBytesConfig(**kwargs)
+
+
+def qwen35_moe_device_map(
+    num_layers: int,
+    layer_types: list[str] | tuple[str, ...],
+    *,
+    layer_prefix: str,
+    extra: dict[str, str | int],
+    gpu: int = 0,
+) -> dict[str, str | int]:
+    """Keep NF4 Linears on GPU. Park packed BF16 expert banks (and vision) on CPU."""
+    device_map: dict[str, str | int] = dict(extra)
+    for index in range(num_layers):
+        prefix = f"{layer_prefix}.{index}"
+        device_map[f"{prefix}.input_layernorm"] = gpu
+        device_map[f"{prefix}.post_attention_layernorm"] = gpu
+        kind = layer_types[index] if index < len(layer_types) else "linear_attention"
+        if kind == "full_attention":
+            device_map[f"{prefix}.self_attn"] = gpu
+        else:
+            device_map[f"{prefix}.linear_attn"] = gpu
+        device_map[f"{prefix}.mlp.gate"] = gpu
+        device_map[f"{prefix}.mlp.shared_expert"] = gpu
+        device_map[f"{prefix}.mlp.shared_expert_gate"] = gpu
+        device_map[f"{prefix}.mlp.experts"] = "cpu"
+    return device_map
+
+
+def iter_qwen35_moe_device_maps(
+    num_layers: int,
+    layer_types: list[str] | tuple[str, ...],
+    *,
+    gpu: int = 0,
+) -> list[dict[str, str | int]]:
+    """VL ConditionalGeneration uses language_model.*; text CausalLM uses model.layers."""
+    return [
+        qwen35_moe_device_map(
+            num_layers,
+            layer_types,
+            layer_prefix="model.language_model.layers",
+            extra={
+                "lm_head": gpu,
+                "model.language_model.embed_tokens": gpu,
+                "model.language_model.norm": gpu,
+                "model.language_model.rotary_emb": gpu,
+                "model.visual": "cpu",
+            },
+            gpu=gpu,
+        ),
+        qwen35_moe_device_map(
+            num_layers,
+            layer_types,
+            layer_prefix="model.layers",
+            extra={
+                "lm_head": gpu,
+                "model.embed_tokens": gpu,
+                "model.norm": gpu,
+                "model.rotary_emb": gpu,
+            },
+            gpu=gpu,
+        ),
+    ]
+
+
+def _text_layer_spec(model_id: str) -> tuple[int, list[str]]:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    text = getattr(config, "text_config", config)
+    num_layers = int(getattr(text, "num_hidden_layers", 40))
+    layer_types = list(getattr(text, "layer_types", None) or [])
+    if not layer_types:
+        layer_types = (["linear_attention"] * 3 + ["full_attention"]) * ((num_layers + 3) // 4)
+        layer_types = layer_types[:num_layers]
+    return num_layers, layer_types
 
 
 def _fourbit_load_kwargs(dtype: str, *, gpu_only: bool, gpu_budget: float) -> dict:
@@ -235,10 +305,6 @@ def _fourbit_load_kwargs(dtype: str, *, gpu_only: bool, gpu_budget: float) -> di
         return kwargs
     kwargs["device_map"] = "auto"
     kwargs["max_memory"] = {0: f"{gpu_budget:.1f}GiB", "cpu": "48GiB"}
-    offload = _offload_folder()
-    if offload:
-        kwargs["offload_folder"] = offload
-        kwargs["offload_state_dict"] = True
     return kwargs
 
 
@@ -250,6 +316,47 @@ def _from_pretrained(model_id: str, load_kwargs: dict):
     except TypeError:
         load_kwargs.pop("offload_state_dict", None)
         return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+
+def _finalize_loaded_lm(model):
+    disable_generation_cache(model)
+    print(describe_hf_device_map(model))
+    meta = list_meta_tensors(model)
+    if meta:
+        print(f"Warning: {len(meta)} tensors still on meta, e.g. {meta[:6]}")
+    return model
+
+
+def _load_moe_nf4(model_id: str, dtype: str):
+    """NF4 the GPU Linears. Never 4-bit-offload — that leaves bitsandbytes quant state on meta."""
+    num_layers, layer_types = _text_layer_spec(model_id)
+    last_error = ""
+    quant = bitsandbytes_config(dtype, cpu_offload=False, double_quant=False)
+    for index, device_map in enumerate(iter_qwen35_moe_device_maps(num_layers, layer_types)):
+        cpu_mods = sum(value == "cpu" for value in device_map.values())
+        print(
+            f"Loading {model_id} in NF4  free_gpu={gpu_free_gb():.1f}GiB  "
+            f"experts+vision on CPU ({cpu_mods} modules, map {index + 1}/2, no 4-bit CPU offload)"
+        )
+        load_kwargs = {
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "quantization_config": quant,
+            "device_map": device_map,
+        }
+        try:
+            model = _from_pretrained(model_id, load_kwargs)
+            return _finalize_loaded_lm(model)
+        except ValueError as exc:
+            last_error = str(exc)
+            print(f"device_map variant {index + 1} rejected: {exc}")
+            _reset_cuda_after_oom()
+        except torch.cuda.OutOfMemoryError as exc:
+            last_error = str(exc)
+            print("MoE NF4 GPU mixers OOM; this should not happen with experts on CPU")
+            del exc
+            _reset_cuda_after_oom()
+    raise RuntimeError(last_error or f"Failed to load {model_id} with expert-CPU device_map")
 
 
 def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
@@ -264,8 +371,10 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
         kwargs["device_map"] = "auto"
         kwargs["torch_dtype"] = torch.bfloat16 if dtype == "bfloat16" else torch.float16
         model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-        disable_generation_cache(model)
-        return model
+        return _finalize_loaded_lm(model)
+
+    if is_moe_checkpoint(model_id):
+        return _load_moe_nf4(model_id, dtype)
 
     free = gpu_free_gb()
     gpu_only = should_load_fourbit_gpu_only(free, model_id)
@@ -287,12 +396,9 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
                 load_kwargs = _fourbit_load_kwargs(dtype, gpu_only=True, gpu_budget=0.0)
             else:
                 assert gpu_budget is not None
-                extra = ""
-                if is_moe_checkpoint(model_id):
-                    extra = "  (MoE expert banks stay BF16; parking overflow on CPU/disk)"
                 print(
                     f"Loading {model_id} in NF4  free_gpu={gpu_free_gb():.1f}GiB  "
-                    f"cpu_offload=True  gpu_budget={gpu_budget:.1f}GiB{extra}"
+                    f"cpu_offload=True  gpu_budget={gpu_budget:.1f}GiB"
                 )
                 load_kwargs = _fourbit_load_kwargs(dtype, gpu_only=False, gpu_budget=gpu_budget)
             model = _from_pretrained(model_id, load_kwargs)
@@ -312,13 +418,7 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
             _reset_cuda_after_oom()
     if model is None:
         raise RuntimeError(last_error or f"Failed to load {model_id} in 4-bit")
-
-    disable_generation_cache(model)
-    print(describe_hf_device_map(model))
-    meta = list_meta_tensors(model)
-    if meta:
-        print(f"Warning: {len(meta)} tensors still on meta, e.g. {meta[:6]}")
-    return model
+    return _finalize_loaded_lm(model)
 
 
 def free_model(model=None) -> None:

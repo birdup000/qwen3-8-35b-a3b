@@ -250,26 +250,44 @@ def load_topk(path: Path) -> dict[str, torch.Tensor]:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _is_lora_linear(module: torch.nn.Module) -> bool:
+    if isinstance(module, torch.nn.Linear):
+        return True
+    return type(module).__name__.lower() in {"linear4bit", "linear8bitlt", "linear8bit"}
+
+
+def _weight_is_meta(module: torch.nn.Module) -> bool:
+    weight = getattr(module, "weight", None)
+    return weight is not None and getattr(weight, "device", None) is not None and weight.device.type == "meta"
+
+
 def resolve_lora_targets(model: torch.nn.Module, candidates: Iterable[str] = LORA_TARGET_CANDIDATES) -> list[str]:
     wanted = set(candidates)
-    found: set[str] = set()
+    found: list[str] = []
     skipped_3d: list[str] = []
+    skipped_meta: list[str] = []
     for name, module in model.named_modules():
         leaf = name.rsplit(".", 1)[-1]
         if leaf not in wanted:
             continue
-        if isinstance(module, torch.nn.Linear):
-            found.add(leaf)
-        else:
+        if not _is_lora_linear(module):
             skipped_3d.append(name)
+            continue
+        if _weight_is_meta(module):
+            skipped_meta.append(name)
+            continue
+        found.append(name)
     if skipped_3d:
         print(f"LoRA skipped non-Linear modules ({len(skipped_3d)}), e.g. {skipped_3d[:3]}")
+    if skipped_meta:
+        print(f"LoRA skipped meta-weight modules ({len(skipped_meta)}), e.g. {skipped_meta[:3]}")
     if not found:
-        found = {"q_proj", "k_proj", "v_proj", "o_proj"}
+        found = [name for name in LORA_TARGET_CANDIDATES if name in {"q_proj", "k_proj", "v_proj", "o_proj"}]
         print("LoRA: no candidate Linear names matched; falling back to attention projections")
-    resolved = [name for name in LORA_TARGET_CANDIDATES if name in found]
-    print(f"LoRA targets: {resolved}")
-    return resolved
+        print(f"LoRA targets: {found}")
+        return found
+    print(f"LoRA targets: {len(found)} modules  e.g. {found[:4]}")
+    return found
 
 
 def tokenize_sft(
@@ -383,7 +401,7 @@ def iter_stage_a_rows(max_rows: int, extra_jsonl: Path | None = None) -> Iterato
                 return
         return
 
-    per_source = max(max_rows // max(len(STAGE_A_SOURCES), 1), 1)
+    per_source = max((max_rows + len(STAGE_A_SOURCES) - 1) // max(len(STAGE_A_SOURCES), 1), 1)
     for spec in STAGE_A_SOURCES:
         if emitted >= max_rows:
             return
@@ -419,7 +437,7 @@ def collect_stage_a_jsonl(path: Path, max_rows: int, extra_jsonl: Path | None = 
     """Write (or resume) Stage A rows. Existing ids are kept."""
     path.parent.mkdir(parents=True, exist_ok=True)
     have = existing_trace_ids(path)
-    if len(have) >= max_rows:
+    if len(have) >= max_rows or (max_rows >= 1000 and len(have) >= max_rows - 3):
         print(f"Reusing {len(have)} Stage A rows in {path}")
         return path
     for row in iter_stage_a_rows(max_rows, extra_jsonl=extra_jsonl):
@@ -451,27 +469,51 @@ def attach_hq_lora(model, r: int = 32, alpha: int = 64):
     from scripts.colab_pipeline import disable_generation_cache
 
     disable_generation_cache(model)
+    has_cpu = any(str(device) in {"cpu", "disk"} for device in (getattr(model, "hf_device_map", None) or {}).values())
+    if has_cpu:
+        print("Skipping prepare_model_for_kbit_training (CPU expert banks; PEFT would serialize 4-bit meta state)")
+        for param in model.parameters():
+            param.requires_grad = False
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        _enable_checkpointing(model)
+    else:
+        try:
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+        except RuntimeError as exc:
+            if "meta" not in str(exc).lower():
+                raise
+            print("prepare_model_for_kbit_training hit meta tensors; enabling input grads only")
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+        else:
+            _enable_checkpointing(model)
+    targets = resolve_lora_targets(model)
     try:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=r,
+                lora_alpha=alpha,
+                lora_dropout=0.05,
+                target_modules=targets,
+            ),
+        )
     except RuntimeError as exc:
         if "meta" not in str(exc).lower():
             raise
-        print("prepare_model_for_kbit_training hit meta tensors; enabling input grads only")
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-    else:
-        _enable_checkpointing(model)
-    targets = resolve_lora_targets(model)
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=r,
-            lora_alpha=alpha,
-            lora_dropout=0.05,
-            target_modules=targets,
-        ),
-    )
+        print("get_peft_model hit meta tensors; retrying with attention projections only")
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=r,
+                lora_alpha=alpha,
+                lora_dropout=0.05,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            ),
+        )
     model.print_trainable_parameters()
     return model
 

@@ -29,6 +29,21 @@ def test_fourbit_gpu_only_skips_moe_experts():
     assert not expert_module_goes_to_cpu("model.layers.0.self_attn.q_proj")
 
 
+def test_qwen35_moe_device_map_parks_experts_not_linears():
+    from scripts.colab_pipeline import iter_qwen35_moe_device_maps
+
+    types = (["linear_attention"] * 3 + ["full_attention"]) * 10
+    vl, text = iter_qwen35_moe_device_maps(40, types)
+    assert vl["model.visual"] == "cpu"
+    assert vl["model.language_model.layers.0.mlp.experts"] == "cpu"
+    assert vl["model.language_model.layers.0.linear_attn"] == 0
+    assert vl["model.language_model.layers.3.self_attn"] == 0
+    assert vl["model.language_model.layers.0.mlp.shared_expert"] == 0
+    assert text["model.layers.0.mlp.experts"] == "cpu"
+    assert text["model.layers.3.self_attn"] == 0
+    assert "model.visual" not in text
+
+
 def test_tiny_pipeline_and_sample_data(tmp_path):
     path = write_sample_data(tmp_path / "distill.jsonl")
     assert path.is_file()
