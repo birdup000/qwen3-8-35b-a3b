@@ -559,38 +559,59 @@ def stage_a_sft(
         return {"adapter": adapter_dir, "rows": rows_path}
 
     student = load_causal_lm(student_id, fourbit=fourbit)
-    if (adapter_dir / "adapter_config.json").is_file():
-        student = _maybe_load_adapter(student, adapter_dir)
-        _enable_checkpointing(student)
-    else:
-        student = attach_hq_lora(student, r=lora_r)
-    student.train()
-    device = _module_device(student)
-    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=lr)
-
-    step = start_step
-    while step < n_steps:
-        example = tokenized[step % len(tokenized)]
-        batch = pack_batch([example, tokenized[(step + 1) % len(tokenized)]], seq_len)
-        batch = {key: value.to(device) for key, value in batch.items()}
-        out = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
-            use_cache=False,
+    try:
+        if (adapter_dir / "adapter_config.json").is_file():
+            student = _maybe_load_adapter(student, adapter_dir)
+            _enable_checkpointing(student)
+        else:
+            student = attach_hq_lora(student, r=lora_r)
+        student.train()
+        device = _module_device(student)
+        optimizer = torch.optim.AdamW(
+            (p for p in student.parameters() if p.requires_grad and p.device.type != "meta"),
+            lr=lr,
         )
-        loss = out.loss
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
-        optimizer.step()
-        step += 1
-        if step == 1 or step % 10 == 0:
-            print(f"stage A step {step}/{n_steps}  ce={loss.item():.4f}")
-        if step % CHECKPOINT_EVERY == 0 or step == n_steps:
-            _save_adapter(student, adapter_dir, {"stage": "A", "a_step": step, "seq_len": seq_len})
-            save_state(state_path, {"a_step": step, "step": step, "stage": "A"})
-            print(f"Checkpointed adapter at step {step}")
+
+        step = start_step
+        while step < n_steps:
+            example = tokenized[step % len(tokenized)]
+            batch = pack_batch([example, tokenized[(step + 1) % len(tokenized)]], seq_len)
+            batch = {key: value.to(device) for key, value in batch.items()}
+            out = student(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                use_cache=False,
+            )
+            loss = out.loss
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
+            optimizer.step()
+            step += 1
+            if step == 1 or step % 10 == 0:
+                print(f"stage A step {step}/{n_steps}  ce={loss.item():.4f}")
+            if step % CHECKPOINT_EVERY == 0 or step == n_steps:
+                _save_adapter(student, adapter_dir, {"stage": "A", "a_step": step, "seq_len": seq_len})
+                save_state(state_path, {"a_step": step, "step": step, "stage": "A"})
+                print(f"Checkpointed adapter at step {step}")
+    except torch.cuda.OutOfMemoryError:
+        free_model(student)
+        if seq_len <= FALLBACK_SEQ_LEN:
+            raise
+        print(f"OOM during Stage A at seq_len={seq_len}; retrying {FALLBACK_SEQ_LEN}")
+        return stage_a_sft(
+            student_id=student_id,
+            work_dir=work_dir,
+            max_rows=max_rows,
+            steps=steps,
+            seq_len=FALLBACK_SEQ_LEN,
+            lr=lr,
+            lora_r=lora_r,
+            fourbit=fourbit,
+            extra_jsonl=extra_jsonl,
+            repo_root=repo_root,
+        )
 
     free_model(student)
     return {"adapter": adapter_dir, "rows": rows_path}
@@ -747,48 +768,70 @@ def stage_c_align(
         return {"adapter": adapter_dir, "traces": traces_path}
 
     student = load_causal_lm(student_id, fourbit=fourbit)
-    if (adapter_dir / "adapter_config.json").is_file():
-        student = _maybe_load_adapter(student, adapter_dir)
-        _enable_checkpointing(student)
-    else:
-        student = attach_hq_lora(student, r=lora_r)
-    student.train()
-    device = _module_device(student)
-    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=lr)
-
-    step = c_step
-    while step < steps:
-        use_a = bool(stage_a) and (step % 10 < int(10 * stage_a_mix))
-        pool = stage_a if use_a else traces
-        row = pool[step % len(pool)]
-        tokenized = tokenize_sft(tokenizer, row, seq_len, formatter)
-        if tokenized is None:
-            step += 1
-            continue
-        batch = {key: value.unsqueeze(0).to(device) for key, value in tokenized.items()}
-        out = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
-            use_cache=False,
+    try:
+        if (adapter_dir / "adapter_config.json").is_file():
+            student = _maybe_load_adapter(student, adapter_dir)
+            _enable_checkpointing(student)
+        else:
+            student = attach_hq_lora(student, r=lora_r)
+        student.train()
+        device = _module_device(student)
+        optimizer = torch.optim.AdamW(
+            (p for p in student.parameters() if p.requires_grad and p.device.type != "meta"),
+            lr=lr,
         )
-        loss = out.loss
-        topk_path = topk_dir / f"{row.get('id')}.pt"
-        if (not use_a) and topk_path.is_file() and kd_weight > 0:
-            packed = load_topk(topk_path)
-            kd = unpack_topk_kd_loss(out.logits, packed, temperature=temperature)
-            loss = loss + kd_weight * kd
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
-        optimizer.step()
-        step += 1
-        if step == c_step + 1 or step % 10 == 0:
-            print(f"stage C step {step}/{steps}  loss={loss.item():.4f}")
-        if step % CHECKPOINT_EVERY == 0 or step == steps:
-            _save_adapter(student, adapter_dir, {"stage": "C", "c_step": step, "seq_len": seq_len})
-            save_state(state_path, {"step": step, "c_step": step, "stage": "C"})
-            print(f"Checkpointed adapter at C step {step}")
+
+        step = c_step
+        while step < steps:
+            use_a = bool(stage_a) and (step % 10 < int(10 * stage_a_mix))
+            pool = stage_a if use_a else traces
+            row = pool[step % len(pool)]
+            tokenized = tokenize_sft(tokenizer, row, seq_len, formatter)
+            if tokenized is None:
+                step += 1
+                continue
+            batch = {key: value.unsqueeze(0).to(device) for key, value in tokenized.items()}
+            out = student(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                use_cache=False,
+            )
+            loss = out.loss
+            topk_path = topk_dir / f"{row.get('id')}.pt"
+            if (not use_a) and topk_path.is_file() and kd_weight > 0:
+                packed = load_topk(topk_path)
+                kd = unpack_topk_kd_loss(out.logits, packed, temperature=temperature)
+                loss = loss + kd_weight * kd
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
+            optimizer.step()
+            step += 1
+            if step == c_step + 1 or step % 10 == 0:
+                print(f"stage C step {step}/{steps}  loss={loss.item():.4f}")
+            if step % CHECKPOINT_EVERY == 0 or step == steps:
+                _save_adapter(student, adapter_dir, {"stage": "C", "c_step": step, "seq_len": seq_len})
+                save_state(state_path, {"step": step, "c_step": step, "stage": "C"})
+                print(f"Checkpointed adapter at C step {step}")
+    except torch.cuda.OutOfMemoryError:
+        free_model(student)
+        if seq_len <= FALLBACK_SEQ_LEN:
+            raise
+        print(f"OOM during Stage C at seq_len={seq_len}; retrying {FALLBACK_SEQ_LEN}")
+        return stage_c_align(
+            student_id=student_id,
+            work_dir=work_dir,
+            steps=steps,
+            seq_len=FALLBACK_SEQ_LEN,
+            lr=lr,
+            temperature=temperature,
+            kd_weight=kd_weight,
+            stage_a_mix=stage_a_mix,
+            lora_r=lora_r,
+            fourbit=fourbit,
+            repo_root=repo_root,
+        )
 
     free_model(student)
     return {"adapter": adapter_dir, "traces": traces_path}

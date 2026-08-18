@@ -109,6 +109,8 @@ def overlay_qwen38_configs(out_dir: Path, repo_root: Path | None = None) -> Path
 
 
 GPU_ONLY_FOURBIT_MIN_FREE_GIB = 28.0
+A100_MOE_GPU_WEIGHT_BUDGET_GIB = 18.0
+A100_80_MOE_GPU_WEIGHT_BUDGET_GIB = 40.0
 
 
 def gpu_free_gb() -> float:
@@ -118,9 +120,73 @@ def gpu_free_gb() -> float:
     return free / (1024**3)
 
 
-def should_load_fourbit_gpu_only(free_gb: float, threshold: float = GPU_ONLY_FOURBIT_MIN_FREE_GIB) -> bool:
-    """A100 40GB can hold 27B/35B NF4 on GPU; CPU offload leaves meta tensors that break PEFT."""
+def gpu_total_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+
+def is_moe_checkpoint(model_id: str) -> bool:
+    """Qwen3.6-35B-A3B expert banks are 3D Parameters; bitsandbytes does not NF4 them."""
+    name = model_id.lower().replace("_", "-")
+    return "a3b" in name or "moe" in name
+
+
+def expert_module_goes_to_cpu(name: str) -> bool:
+    lowered = name.lower()
+    if "shared_expert" in lowered:
+        return False
+    return lowered.endswith(".experts") or ".experts." in lowered or lowered.endswith("mlp.experts")
+
+
+def gpu_weight_budget_gib(free_gb: float | None = None, total_gb: float | None = None) -> float:
+    """Leave headroom on a 40GB A100. Packed MoE experts stay BF16 (~64GB) and must spill."""
+    free = gpu_free_gb() if free_gb is None else free_gb
+    total = gpu_total_gb() if total_gb is None else total_gb
+    cap = A100_80_MOE_GPU_WEIGHT_BUDGET_GIB if total >= 70 else A100_MOE_GPU_WEIGHT_BUDGET_GIB
+    return max(8.0, min(cap, free - 10.0))
+
+
+def should_load_fourbit_gpu_only(
+    free_gb: float,
+    model_id: str = "",
+    threshold: float = GPU_ONLY_FOURBIT_MIN_FREE_GIB,
+) -> bool:
+    """Dense 27B NF4 can sit on a 40GB card. 35B-A3B expert banks cannot."""
+    if model_id and is_moe_checkpoint(model_id):
+        return False
     return free_gb >= threshold
+
+
+def describe_hf_device_map(model) -> str:
+    mapping = getattr(model, "hf_device_map", None)
+    if not mapping:
+        return "device_map=gpu"
+    counts: dict[str, int] = {}
+    for device in mapping.values():
+        key = str(device)
+        counts[key] = counts.get(key, 0) + 1
+    return "device_map=" + ",".join(f"{device}:{count}" for device, count in sorted(counts.items()))
+
+
+def _reset_cuda_after_oom() -> None:
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def _offload_folder() -> str | None:
+    root = Path("/content")
+    if not root.is_dir():
+        return None
+    path = root / "qwen38_offload"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 def list_meta_tensors(model) -> list[str]:
@@ -158,42 +224,97 @@ def bitsandbytes_config(dtype: str = "bfloat16", cpu_offload: bool = False):
     return BitsAndBytesConfig(**kwargs)
 
 
+def _fourbit_load_kwargs(dtype: str, *, gpu_only: bool, gpu_budget: float) -> dict:
+    kwargs: dict = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "quantization_config": bitsandbytes_config(dtype, cpu_offload=not gpu_only),
+    }
+    if gpu_only:
+        kwargs["device_map"] = {"": 0}
+        return kwargs
+    kwargs["device_map"] = "auto"
+    kwargs["max_memory"] = {0: f"{gpu_budget:.1f}GiB", "cpu": "48GiB"}
+    offload = _offload_folder()
+    if offload:
+        kwargs["offload_folder"] = offload
+        kwargs["offload_state_dict"] = True
+    return kwargs
+
+
+def _from_pretrained(model_id: str, load_kwargs: dict):
+    from transformers import AutoModelForCausalLM
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop("offload_state_dict", None)
+        return AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+
 def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
     from transformers import AutoModelForCausalLM
 
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     kwargs = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
     }
-    if fourbit:
-        free = gpu_free_gb()
-        gpu_only = should_load_fourbit_gpu_only(free)
-        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=not gpu_only)
-        if gpu_only:
-            print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  device=cuda:0")
-            kwargs["device_map"] = {"": 0}
-        else:
-            print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  cpu_offload=True")
-            kwargs["device_map"] = "auto"
-            if torch.cuda.is_available():
-                budget = max(free - 2.0, 8.0)
-                kwargs["max_memory"] = {0: f"{budget:.1f}GiB", "cpu": "80GiB"}
-    else:
+    if not fourbit:
         kwargs["device_map"] = "auto"
         kwargs["torch_dtype"] = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-    try:
         model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-    except ValueError as exc:
-        message = str(exc)
-        if "CPU or the disk" not in message and "cpu or the disk" not in message.lower():
-            raise
-        print("Retrying 4-bit load with explicit CPU offload after dispatch error")
-        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=True)
-        kwargs["device_map"] = "auto"
-        if torch.cuda.is_available():
-            kwargs["max_memory"] = {0: f"{max(gpu_free_gb() - 2.0, 6.0):.1f}GiB", "cpu": "80GiB"}
-        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        disable_generation_cache(model)
+        return model
+
+    free = gpu_free_gb()
+    gpu_only = should_load_fourbit_gpu_only(free, model_id)
+    attempts: list[tuple[str, float | None]] = []
+    if gpu_only:
+        attempts.append(("gpu-only", None))
+    budget = gpu_weight_budget_gib(free)
+    attempts.append(("cpu-offload", budget))
+    if budget > 12.0:
+        attempts.append(("cpu-offload", 12.0))
+    attempts.append(("cpu-offload", 8.0))
+
+    last_error = ""
+    model = None
+    for mode, gpu_budget in attempts:
+        try:
+            if mode == "gpu-only":
+                print(f"Loading {model_id} in NF4  free_gpu={gpu_free_gb():.1f}GiB  device=cuda:0")
+                load_kwargs = _fourbit_load_kwargs(dtype, gpu_only=True, gpu_budget=0.0)
+            else:
+                assert gpu_budget is not None
+                extra = ""
+                if is_moe_checkpoint(model_id):
+                    extra = "  (MoE expert banks stay BF16; parking overflow on CPU/disk)"
+                print(
+                    f"Loading {model_id} in NF4  free_gpu={gpu_free_gb():.1f}GiB  "
+                    f"cpu_offload=True  gpu_budget={gpu_budget:.1f}GiB{extra}"
+                )
+                load_kwargs = _fourbit_load_kwargs(dtype, gpu_only=False, gpu_budget=gpu_budget)
+            model = _from_pretrained(model_id, load_kwargs)
+            break
+        except torch.cuda.OutOfMemoryError as exc:
+            last_error = str(exc)
+            print(f"NF4 load OOM ({mode}, budget={gpu_budget}); freeing GPU and retrying")
+            del exc
+            _reset_cuda_after_oom()
+        except ValueError as exc:
+            message = str(exc)
+            if "cpu or the disk" not in message.lower() and "CPU or the disk" not in message:
+                raise
+            last_error = message
+            print("Retrying 4-bit load with explicit CPU offload after dispatch error")
+            del exc
+            _reset_cuda_after_oom()
+    if model is None:
+        raise RuntimeError(last_error or f"Failed to load {model_id} in 4-bit")
+
     disable_generation_cache(model)
+    print(describe_hf_device_map(model))
     meta = list_meta_tensors(model)
     if meta:
         print(f"Warning: {len(meta)} tensors still on meta, e.g. {meta[:6]}")
