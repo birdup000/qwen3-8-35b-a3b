@@ -22,7 +22,9 @@ def test_colab_notebook_is_hq_distill_and_gguf_only():
     assert "hq_maxmix" in text
     assert "r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation" in text
     assert "sft_balanced" in text
+    assert "run_chase_27b" in text
+    assert "hq_27b" in text
+    assert "5b. Chase Qwen3.8-27B" in text
     assert "run_full_pipeline" not in text
     assert "Smoke distill" not in text
     assert "64 short prompts" not in text
-    assert "section 5b" not in text

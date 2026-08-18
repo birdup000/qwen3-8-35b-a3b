@@ -752,6 +752,12 @@ def run_hq_stage_c(**kwargs):
     return stage_c_align(**kwargs)
 
 
+def run_chase_27b(**kwargs):
+    from scripts.chase_27b import run_chase
+
+    return run_chase(**kwargs)
+
+
 def run_hq_pipeline(**kwargs):
     """Drive-resumable 3.8-quality distill. Reload after Colab disconnects."""
     from scripts.hq_distill import run_hq_pipeline as _run

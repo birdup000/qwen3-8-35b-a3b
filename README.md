@@ -59,6 +59,18 @@ python scripts/hq_distill.py --stage a \
 
 Default Stage A is [`r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation`](https://huggingface.co/datasets/r0b0tlab/qwen3.8-max-glm5.2-kimi-k3-distillation) (`sft_balanced`): Qwen3.8-Max-Preview + GLM-5.2 + Kimi K3 traces, **not** open Qwen3.8-27B logits. License on that dataset is `other` (mixed upstream + Model Studio terms) — treat as **noncommercial research**. Stage B/C (27B generate + top-k KD) stay off unless you pass `--stage b` / `--stage c`. UltraChat mix: `--sft-dataset ""`. Use a **new** work dir (`hq_maxmix`); do not reuse an UltraChat `hq/` jsonl.
 
+After Stage A **finishes** (`a_step` 4000), chase **open Qwen3.8-27B** in a second work dir. Keep the running maxmix job; chase refuses to start until that LoRA is complete. More Max SFT will not close the ~9pt LiveCodeBench gap. This path is: hard **prompts only** (OpenCodeReasoning / OpenThoughts3 / Magicoder; drop QwQ/R1/Max answers) → 27B generate + top-256 logits → truncated reverse KL (MiniLLM, mode-seeking) → student rollouts scored by 27B (GKD on-policy). Sequential loads; teacher and student never share the GPU.
+
+```bash
+python scripts/chase_27b.py \
+  --work-dir /content/drive/MyDrive/Qwen3.8-35B-A3B/hq_27b \
+  --seed-adapter /content/drive/MyDrive/Qwen3.8-35B-A3B/hq_maxmix/adapter \
+  --stage-a-jsonl /content/drive/MyDrive/Qwen3.8-35B-A3B/hq_maxmix/stage_a.jsonl \
+  --stage prompts   # then b, then c, then d
+```
+
+40GB: `--max-traces 4000 --seq-len 2048 --max-new-tokens 1536`. 80GB: raise traces / seq / new tokens. Frozen expert banks still cap you below dense 27B; matching LiveCodeBench 90 likely needs expert training on 80GB+.
+
 ```bash
 python scripts/export_gguf.py \
   --lora checkpoints/Qwen3.8-35B-A3B-lora \
@@ -132,12 +144,15 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 Runtime → **A100 40GB+**, High-RAM if you also export GGUF. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
 
-The Colab is **Stage A SFT** of the 35B-A3B on the Max/GLM/Kimi corpus (Drive `hq_maxmix`), then Unsloth-style `UD-Q4_K_XL` GGUF. Broad LoRA (attention + DeltaNet + shared expert). Re-run section 5 after a disconnect; checkpoints resume. This is **not** 27B-dense parity and **not** open Qwen3.8-27B KD — frozen experts stay 3.6, decode stays ~3B active. Optional `--stage b` / `--stage c` if you still want 27B KL.
+The Colab is **Stage A SFT** of the 35B-A3B on the Max/GLM/Kimi corpus (Drive `hq_maxmix`), then optional **section 5b** chase of open Qwen3.8-27B into `hq_27b`, then Unsloth-style `UD-Q4_K_XL` GGUF. Broad LoRA (attention + DeltaNet + shared expert). Re-run section 5 after a disconnect; checkpoints resume. Frozen experts stay 3.6, decode stays ~3B active. Do not start 5b while Stage A is running.
 
 | HQ stage (cached weights) | A100 40GB ballpark |
 | --- | --- |
 | A: SFT 16k rows, 4000×2048 (CPU expert paging) | 10–40 h |
-| B / C | skipped (traces already in the dataset) |
+| 5b prompts: stream OT3 / Magicoder / OpenCodeReasoning questions | 10–40 min |
+| 5b B: 27B generate + top-256 packs (~4k traces) | 1–4 d |
+| 5b C: reverse-KL LoRA 6000 steps | similar to A |
+| 5b D: student rollouts + 27B score + 3000 steps | extra day+ |
 | GGUF `UD-Q4_K_XL` | 2–4 h |
 
 After distill, section 8 merges the HQ LoRA and writes `UD-Q4_K_XL` / `UD-Q3_K_XL`.

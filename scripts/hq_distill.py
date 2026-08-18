@@ -272,8 +272,15 @@ def unpack_topk_kd_loss(
     student_logits: torch.Tensor,
     packed: dict[str, torch.Tensor],
     temperature: float = 2.0,
+    reverse: bool = False,
+    prompt_len: int | None = None,
 ) -> torch.Tensor:
-    """KL(teacher_topk || student) using only the stored teacher mass."""
+    """Top-k KL on stored teacher mass.
+
+    Forward (default): KL(teacher || student) — mode-covering.
+    Reverse: truncated KL(student || teacher) — mode-seeking, better when the
+    student cannot represent the dense teacher (27B → 3B-active).
+    """
     values = packed["values"].to(device=student_logits.device, dtype=torch.float32)
     indices = packed["indices"].to(device=student_logits.device, dtype=torch.long)
     if student_logits.dim() == 3:
@@ -282,9 +289,25 @@ def unpack_topk_kd_loss(
     student = student_logits[:seq]
     values = values[:seq]
     indices = indices[:seq]
+    if prompt_len is None and "prompt_len" in packed:
+        prompt_len = int(packed["prompt_len"].item())
+    prompt_len = int(prompt_len or 0)
+    if prompt_len > 0:
+        # Causal LM: logits[t] predict token t+1. First assistant token is at
+        # index prompt_len, so keep logits from prompt_len - 1 onward.
+        start = min(max(prompt_len - 1, 0), seq - 1)
+        student = student[start:]
+        values = values[start:]
+        indices = indices[start:]
+    if student.numel() == 0:
+        return student.new_zeros(())
     t = temperature
-    teacher = torch.softmax(values / t, dim=-1)
     student_sel = student.gather(-1, indices)
+    if reverse:
+        teacher_log = torch.log_softmax(values / t, dim=-1)
+        student_prob = torch.softmax(student_sel.float() / t, dim=-1)
+        return F.kl_div(teacher_log, student_prob, reduction="batchmean") * (t * t)
+    teacher = torch.softmax(values / t, dim=-1)
     student_log = F.log_softmax(student_sel.float() / t, dim=-1)
     return F.kl_div(student_log, teacher, reduction="batchmean") * (t * t)
 
@@ -665,13 +688,13 @@ def attach_hq_lora(model, r: int = 32, alpha: int = 64):
     return model
 
 
-def _maybe_load_adapter(model, adapter_dir: Path):
+def _maybe_load_adapter(model, adapter_dir: Path, is_trainable: bool = True):
     if not (adapter_dir / "adapter_config.json").is_file():
         return model
     from peft import PeftModel
 
-    print(f"Resuming adapter {adapter_dir}")
-    return PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=True)
+    print(f"Resuming adapter {adapter_dir} trainable={is_trainable}")
+    return PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=is_trainable)
 
 
 def _save_adapter(model, adapter_dir: Path, extra: dict[str, Any]) -> None:
@@ -852,6 +875,29 @@ def _prompt_pool_from_stage_a(rows_path: Path, limit: int) -> list[dict[str, Any
     return prompts[:limit]
 
 
+def load_prompt_pool(work_dir: Path, max_traces: int) -> list[dict[str, Any]]:
+    """Prefer chase prompts.jsonl (hard OT3/code prompts). Else Stage A users."""
+    work_dir = Path(work_dir)
+    chase = work_dir / "prompts.jsonl"
+    if chase.is_file():
+        prompts: list[dict[str, Any]] = []
+        for row in iter_jsonl(chase):
+            messages = row.get("messages") or []
+            messages = [m for m in messages if m.get("role") != "assistant"]
+            if not messages:
+                continue
+            user = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
+            if not user:
+                continue
+            prompts.append({"id": str(row.get("id") or f"prompt-{len(prompts)}"), "messages": messages, "user": user})
+            if len(prompts) >= max_traces:
+                break
+        if prompts:
+            print(f"Chase prompt pool: {len(prompts)} from {chase}")
+            return prompts
+    return _prompt_pool_from_stage_a(work_dir / "stage_a.jsonl", max_traces)
+
+
 def stage_b_traces(
     *,
     teacher_id: str,
@@ -861,6 +907,7 @@ def stage_b_traces(
     seq_len: int = DEFAULT_SEQ_LEN,
     top_k: int = DEFAULT_TOP_K,
     fourbit: bool = True,
+    prompts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Path]:
     from transformers import AutoTokenizer
 
@@ -876,7 +923,7 @@ def stage_b_traces(
 
     formatter = default_formatter()
     sampling = formatter.sampling()
-    prompts = _prompt_pool_from_stage_a(work_dir / "stage_a.jsonl", max_traces)
+    prompts = prompts if prompts is not None else load_prompt_pool(work_dir, max_traces)
     tokenizer = AutoTokenizer.from_pretrained(teacher_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -921,6 +968,8 @@ def stage_b_traces(
         with torch.no_grad():
             logits = teacher(**full_enc).logits[0].float().cpu()
         packed = pack_topk_logits(logits, k=top_k)
+        prompt_tok = tokenizer(formatter.format_messages(prompt_row["messages"], add_generation_prompt=True), add_special_tokens=False)
+        packed["prompt_len"] = torch.tensor(min(len(prompt_tok["input_ids"]), logits.size(0) - 1), dtype=torch.int32)
         save_topk(topk_dir / f"{prompt_row['id']}.pt", packed)
         append_jsonl(
             traces_path,
@@ -938,6 +987,147 @@ def stage_b_traces(
     return {"traces": traces_path, "topk": topk_dir}
 
 
+def generate_rollouts(
+    *,
+    model_id: str,
+    work_dir: Path,
+    traces_name: str,
+    max_traces: int,
+    max_new_tokens: int = 1024,
+    seq_len: int = DEFAULT_SEQ_LEN,
+    fourbit: bool = True,
+    adapter_dir: Path | None = None,
+    id_prefix: str = "opd",
+) -> Path:
+    """Student (or any causal LM) writes completions for the chase prompt pool. No logits."""
+    from transformers import AutoTokenizer
+
+    from scripts.colab_pipeline import free_model, load_causal_lm, overlay_qwen38_configs
+
+    work_dir = Path(work_dir)
+    traces_path = work_dir / traces_name
+    have = existing_trace_ids(traces_path)
+    if len(have) >= max_traces:
+        print(f"Reusing {len(have)} rollouts in {traces_path}")
+        return traces_path
+
+    formatter = default_formatter()
+    sampling = formatter.sampling()
+    prompts = load_prompt_pool(work_dir, max_traces)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = load_causal_lm(model_id, fourbit=fourbit)
+    try:
+        if adapter_dir is not None and (Path(adapter_dir) / "adapter_config.json").is_file():
+            overlay_qwen38_configs(Path(adapter_dir))
+            model = _maybe_load_adapter(model, Path(adapter_dir), is_trainable=False)
+        model.eval()
+        device = _module_device(model)
+        for prompt_row in prompts:
+            row_id = f"{id_prefix}-{prompt_row['id']}"
+            if row_id in have:
+                continue
+            if len(have) >= max_traces:
+                break
+            prompt_text = formatter.format_messages(prompt_row["messages"], add_generation_prompt=True)
+            encoded = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=seq_len)
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            try:
+                with torch.no_grad():
+                    generated = model.generate(
+                        **encoded,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=sampling.temperature,
+                        top_p=sampling.top_p,
+                        top_k=sampling.top_k,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                print("OOM during rollout generate; cutting max_new_tokens in half")
+                max_new_tokens = max(256, max_new_tokens // 2)
+                torch.cuda.empty_cache()
+                continue
+            completion_ids = generated[0, encoded["input_ids"].size(-1) :]
+            completion = tokenizer.decode(completion_ids, skip_special_tokens=False).strip()
+            if not completion:
+                continue
+            if "<think>" not in completion:
+                completion = f"<think>\n{completion}"
+            messages = list(prompt_row["messages"]) + [{"role": "assistant", "content": completion}]
+            append_jsonl(
+                traces_path,
+                {
+                    "id": row_id,
+                    "messages": messages,
+                    "completion_tokens": int(completion_ids.numel()),
+                    "student": model_id,
+                    "prompt_id": prompt_row["id"],
+                },
+            )
+            have.add(row_id)
+            print(f"rollout {len(have)}/{max_traces}  new_tokens={completion_ids.numel()}")
+    finally:
+        free_model(model)
+    return traces_path
+
+
+def score_traces_topk(
+    *,
+    teacher_id: str,
+    work_dir: Path,
+    traces_name: str,
+    seq_len: int = DEFAULT_SEQ_LEN,
+    top_k: int = DEFAULT_TOP_K,
+    fourbit: bool = True,
+) -> Path:
+    """Teacher forward on existing traces; write missing top-k packs (on-policy scoring)."""
+    from transformers import AutoTokenizer
+
+    from scripts.colab_pipeline import free_model, load_causal_lm
+
+    work_dir = Path(work_dir)
+    traces_path = work_dir / traces_name
+    topk_dir = work_dir / "topk"
+    if not traces_path.is_file():
+        raise FileNotFoundError(traces_path)
+    formatter = default_formatter()
+    tokenizer = AutoTokenizer.from_pretrained(teacher_id, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    teacher = load_causal_lm(teacher_id, fourbit=fourbit)
+    teacher.eval()
+    device = _module_device(teacher)
+    scored = 0
+    try:
+        for row in iter_jsonl(traces_path):
+            row_id = str(row["id"])
+            dest = topk_dir / f"{row_id}.pt"
+            if dest.is_file():
+                continue
+            messages = row.get("messages") or []
+            if not messages or messages[-1].get("role") != "assistant":
+                continue
+            full_text = formatter.format_messages(messages, add_generation_prompt=False)
+            full_enc = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=seq_len)
+            full_enc = {key: value.to(device) for key, value in full_enc.items()}
+            with torch.no_grad():
+                logits = teacher(**full_enc).logits[0].float().cpu()
+            packed = pack_topk_logits(logits, k=top_k)
+            prompt = [m for m in messages if m.get("role") != "assistant"]
+            prompt_tok = tokenizer(formatter.format_messages(prompt, add_generation_prompt=True), add_special_tokens=False)
+            packed["prompt_len"] = torch.tensor(min(len(prompt_tok["input_ids"]), logits.size(0) - 1), dtype=torch.int32)
+            save_topk(dest, packed)
+            scored += 1
+            if scored == 1 or scored % 10 == 0:
+                print(f"scored {scored} traces with {teacher_id}")
+    finally:
+        free_model(teacher)
+    print(f"Teacher scored {scored} new top-k packs in {topk_dir}")
+    return topk_dir
+
+
 def stage_c_align(
     *,
     student_id: str,
@@ -950,6 +1140,9 @@ def stage_c_align(
     stage_a_mix: float = 0.3,
     lora_r: int = 32,
     fourbit: bool = True,
+    reverse_kl: bool = False,
+    traces_name: str = "traces.jsonl",
+    step_key: str = "c_step",
     repo_root: Path | None = None,
 ) -> dict[str, Path]:
     from transformers import AutoTokenizer
@@ -957,7 +1150,7 @@ def stage_c_align(
     from scripts.colab_pipeline import free_model, load_causal_lm, overlay_qwen38_configs
 
     work_dir = Path(work_dir)
-    traces_path = work_dir / "traces.jsonl"
+    traces_path = work_dir / traces_name
     topk_dir = work_dir / "topk"
     rows_path = work_dir / "stage_a.jsonl"
     adapter_dir = work_dir / "adapter"
@@ -975,9 +1168,10 @@ def stage_c_align(
     stage_a = list(iter_jsonl(rows_path)) if rows_path.is_file() else []
     state_path = adapter_dir / "state.json"
     state = load_state(state_path)
-    c_step = int(state.get("c_step", 0))
+    c_step = int(state.get(step_key, 0))
+    stage_label = "D" if step_key == "d_step" else "C"
     if c_step >= steps and (adapter_dir / "adapter_config.json").is_file():
-        print(f"Stage C already complete at c_step {c_step}; skipping train")
+        print(f"Stage {stage_label} already complete at {step_key} {c_step}; skipping train")
         return {"adapter": adapter_dir, "traces": traces_path}
 
     student = load_causal_lm(student_id, fourbit=fourbit)
@@ -996,8 +1190,9 @@ def stage_c_align(
         from scripts.colab_pipeline import gpu_free_gb
 
         print(
-            f"Stage C train: steps={steps} seq_len={seq_len} device={device} "
-            f"free_gpu={gpu_free_gb():.1f}GiB. First forward can take several minutes."
+            f"Stage {stage_label} train: steps={steps} seq_len={seq_len} device={device} "
+            f"kd_weight={kd_weight} reverse_kl={reverse_kl} traces={traces_name} "
+            f"{step_key}={c_step} free_gpu={gpu_free_gb():.1f}GiB. First forward can take several minutes."
         )
 
         step = c_step
@@ -1020,7 +1215,7 @@ def stage_c_align(
             topk_path = topk_dir / f"{row.get('id')}.pt"
             if (not use_a) and topk_path.is_file() and kd_weight > 0:
                 packed = load_topk(topk_path)
-                kd = unpack_topk_kd_loss(out.logits, packed, temperature=temperature)
+                kd = unpack_topk_kd_loss(out.logits, packed, temperature=temperature, reverse=reverse_kl)
                 loss = loss + kd_weight * kd
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1028,11 +1223,15 @@ def stage_c_align(
             optimizer.step()
             step += 1
             if step == c_step + 1 or step % 10 == 0:
-                print(f"stage C step {step}/{steps}  loss={loss.item():.4f}")
+                print(f"stage {stage_label} step {step}/{steps}  loss={loss.item():.4f}")
             if step % CHECKPOINT_EVERY == 0 or step == steps:
-                _save_adapter(student, adapter_dir, {"stage": "C", "c_step": step, "seq_len": seq_len})
-                save_state(state_path, {"step": step, "c_step": step, "stage": "C"})
-                print(f"Checkpointed adapter at C step {step}")
+                _save_adapter(
+                    student,
+                    adapter_dir,
+                    {"stage": stage_label, step_key: step, "seq_len": seq_len, "traces": traces_name},
+                )
+                save_state(state_path, {"step": step, step_key: step, "stage": stage_label})
+                print(f"Checkpointed adapter at {stage_label} step {step}")
     except torch.cuda.OutOfMemoryError:
         free_model(student)
         if seq_len <= FALLBACK_SEQ_LEN:
@@ -1049,6 +1248,9 @@ def stage_c_align(
             stage_a_mix=stage_a_mix,
             lora_r=lora_r,
             fourbit=fourbit,
+            reverse_kl=reverse_kl,
+            traces_name=traces_name,
+            step_key=step_key,
             repo_root=repo_root,
         )
 

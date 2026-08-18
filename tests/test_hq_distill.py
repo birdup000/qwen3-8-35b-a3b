@@ -111,6 +111,12 @@ def test_topk_pack_unpack_kd_finite():
     loss = unpack_topk_kd_loss(student.unsqueeze(0), packed, temperature=2.0)
     assert torch.isfinite(loss)
     assert float(loss) >= 0.0
+    packed["prompt_len"] = torch.tensor(2, dtype=torch.int32)
+    rev = unpack_topk_kd_loss(student.unsqueeze(0), packed, temperature=2.0, reverse=True)
+    assert torch.isfinite(rev)
+    assert float(rev) >= 0.0
+    fwd = unpack_topk_kd_loss(student.unsqueeze(0), packed, temperature=2.0, reverse=False)
+    assert float(rev) != float(fwd)
 
 
 def test_lora_candidates_cover_hybrid_and_moe():
