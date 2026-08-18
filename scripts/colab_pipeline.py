@@ -108,11 +108,39 @@ def overlay_qwen38_configs(out_dir: Path, repo_root: Path | None = None) -> Path
     return out_dir
 
 
+GPU_ONLY_FOURBIT_MIN_FREE_GIB = 28.0
+
+
 def gpu_free_gb() -> float:
     if not torch.cuda.is_available():
         return 0.0
     free, _total = torch.cuda.mem_get_info()
     return free / (1024**3)
+
+
+def should_load_fourbit_gpu_only(free_gb: float, threshold: float = GPU_ONLY_FOURBIT_MIN_FREE_GIB) -> bool:
+    """A100 40GB can hold 27B/35B NF4 on GPU; CPU offload leaves meta tensors that break PEFT."""
+    return free_gb >= threshold
+
+
+def list_meta_tensors(model) -> list[str]:
+    names: list[str] = []
+    for name, param in model.named_parameters():
+        if getattr(param, "device", None) is not None and param.device.type == "meta":
+            names.append(name)
+    for name, buf in model.named_buffers():
+        if buf is not None and getattr(buf, "device", None) is not None and buf.device.type == "meta":
+            names.append(name)
+    return names
+
+
+def disable_generation_cache(model) -> None:
+    """Hybrid Gated DeltaNet cache does .item() on meta tensors during train."""
+    for obj in (model, getattr(model, "config", None), getattr(getattr(model, "config", None), "text_config", None)):
+        if obj is None:
+            continue
+        if hasattr(obj, "use_cache"):
+            obj.use_cache = False
 
 
 def bitsandbytes_config(dtype: str = "bfloat16", cpu_offload: bool = False):
@@ -139,17 +167,22 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
     }
     if fourbit:
         free = gpu_free_gb()
-        print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  cpu_offload=True")
-        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=True)
-        kwargs["device_map"] = "auto"
-        if torch.cuda.is_available():
-            budget = max(free - 2.0, 8.0)
-            kwargs["max_memory"] = {0: f"{budget:.1f}GiB", "cpu": "80GiB"}
+        gpu_only = should_load_fourbit_gpu_only(free)
+        kwargs["quantization_config"] = bitsandbytes_config(dtype, cpu_offload=not gpu_only)
+        if gpu_only:
+            print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  device=cuda:0")
+            kwargs["device_map"] = {"": 0}
+        else:
+            print(f"Loading {model_id} in NF4  free_gpu={free:.1f}GiB  cpu_offload=True")
+            kwargs["device_map"] = "auto"
+            if torch.cuda.is_available():
+                budget = max(free - 2.0, 8.0)
+                kwargs["max_memory"] = {0: f"{budget:.1f}GiB", "cpu": "80GiB"}
     else:
         kwargs["device_map"] = "auto"
         kwargs["torch_dtype"] = torch.bfloat16 if dtype == "bfloat16" else torch.float16
     try:
-        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     except ValueError as exc:
         message = str(exc)
         if "CPU or the disk" not in message and "cpu or the disk" not in message.lower():
@@ -159,7 +192,12 @@ def load_causal_lm(model_id: str, fourbit: bool, dtype: str = "bfloat16"):
         kwargs["device_map"] = "auto"
         if torch.cuda.is_available():
             kwargs["max_memory"] = {0: f"{max(gpu_free_gb() - 2.0, 6.0):.1f}GiB", "cpu": "80GiB"}
-        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    disable_generation_cache(model)
+    meta = list_meta_tensors(model)
+    if meta:
+        print(f"Warning: {len(meta)} tensors still on meta, e.g. {meta[:6]}")
+    return model
 
 
 def free_model(model=None) -> None:
@@ -310,7 +348,15 @@ def distill_student_from_logits(
     free_model()
     student = load_causal_lm(student_id, fourbit=fourbit)
     if lora:
-        student = prepare_model_for_kbit_training(student)
+        disable_generation_cache(student)
+        try:
+            student = prepare_model_for_kbit_training(student, use_gradient_checkpointing=False)
+        except RuntimeError as exc:
+            if "meta" not in str(exc).lower():
+                raise
+            print("prepare_model_for_kbit_training hit meta tensors; enabling input grads only")
+            if hasattr(student, "enable_input_require_grads"):
+                student.enable_input_require_grads()
         student = get_peft_model(
             student,
             LoraConfig(
@@ -323,9 +369,13 @@ def distill_student_from_logits(
         )
         student.print_trainable_parameters()
     student.train()
-    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.requires_grad), lr=lr)
+    disable_generation_cache(student)
+    optimizer = torch.optim.AdamW((p for p in student.parameters() if p.device.type != "meta" and p.requires_grad), lr=lr)
     embed = student.get_input_embeddings()
-    device = embed.weight.device if embed is not None else next(p for p in student.parameters() if p.device.type != "meta").device
+    if embed is not None and getattr(embed, "weight", None) is not None and embed.weight.device.type != "meta":
+        device = embed.weight.device
+    else:
+        device = next(p for p in student.parameters() if p.device.type != "meta").device
 
     batches = list(_iter_saved_batches(logits_path))
     if not batches:
@@ -337,13 +387,13 @@ def distill_student_from_logits(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         teacher_logits = batch["logits"].to(device)
-        out = student(input_ids=input_ids, attention_mask=attention_mask)
+        out = student(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         student_logits = out.logits
         length = min(student_logits.size(1), teacher_logits.size(1))
         loss = kd_loss(student_logits[:, :length], teacher_logits[:, :length], temperature)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
         optimizer.step()
         step += 1
         if step == 1 or step % 10 == 0:

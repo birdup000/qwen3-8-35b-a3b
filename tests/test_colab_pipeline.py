@@ -1,10 +1,16 @@
-from scripts.colab_pipeline import detect_runtime, run_tiny_pipeline, write_sample_data
+from scripts.colab_pipeline import detect_runtime, run_tiny_pipeline, should_load_fourbit_gpu_only, write_sample_data
 
 
 def test_detect_runtime_keys():
     info = detect_runtime()
     assert "gpu" in info and "recommend_full" in info
     assert info["vram_gb"] >= 0
+
+
+def test_fourbit_gpu_only_threshold():
+    assert should_load_fourbit_gpu_only(38.8)
+    assert should_load_fourbit_gpu_only(28.0)
+    assert not should_load_fourbit_gpu_only(22.0)
 
 
 def test_tiny_pipeline_and_sample_data(tmp_path):

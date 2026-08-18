@@ -421,8 +421,19 @@ def _enable_checkpointing(model) -> None:
 def attach_hq_lora(model, r: int = 32, alpha: int = 64):
     from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
-    model = prepare_model_for_kbit_training(model)
-    _enable_checkpointing(model)
+    from scripts.colab_pipeline import disable_generation_cache
+
+    disable_generation_cache(model)
+    try:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    except RuntimeError as exc:
+        if "meta" not in str(exc).lower():
+            raise
+        print("prepare_model_for_kbit_training hit meta tensors; enabling input grads only")
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+    else:
+        _enable_checkpointing(model)
     targets = resolve_lora_targets(model)
     model = get_peft_model(
         model,
@@ -535,11 +546,16 @@ def stage_a_sft(
         example = tokenized[step % len(tokenized)]
         batch = pack_batch([example, tokenized[(step + 1) % len(tokenized)]], seq_len)
         batch = {key: value.to(device) for key, value in batch.items()}
-        out = student(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
+        out = student(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            use_cache=False,
+        )
         loss = out.loss
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
         optimizer.step()
         step += 1
         if step == 1 or step % 10 == 0:
@@ -723,7 +739,12 @@ def stage_c_align(
             step += 1
             continue
         batch = {key: value.unsqueeze(0).to(device) for key, value in tokenized.items()}
-        out = student(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
+        out = student(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            use_cache=False,
+        )
         loss = out.loss
         topk_path = topk_dir / f"{row.get('id')}.pt"
         if (not use_a) and topk_path.is_file() and kd_weight > 0:
@@ -732,7 +753,7 @@ def stage_c_align(
             loss = loss + kd_weight * kd
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_((p for p in student.parameters() if p.device.type != "meta"), 1.0)
         optimizer.step()
         step += 1
         if step == c_step + 1 or step % 10 == 0:
