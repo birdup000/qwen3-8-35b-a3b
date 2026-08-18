@@ -102,7 +102,7 @@ REPO_URL=https://github.com/birdup000/qwen3-8-35b-a3b.git DEST=./qwen3-8-35b-a3b
 
 [Open in Colab](https://colab.research.google.com/github/birdup000/qwen3-8-35b-a3b/blob/main/notebooks/Qwen3.8-35B-A3B_Colab.ipynb)
 
-Runtime → **A100 40GB+**. Secret: `HF_TOKEN`. The first code cells clone this repo and `pip install -e ".[colab]"`, then run the full 4-bit two-phase distill. Do not snapshot both models in BF16.
+Runtime → **A100 40GB+**. The notebook clones this repo and `pip install -e ".[colab]"`. Hugging Face login uses a Colab secret named `HF_TOKEN` if you added one; otherwise it opens the Hugging Face widget. Do not snapshot both models in BF16.
 
 ## License
 
